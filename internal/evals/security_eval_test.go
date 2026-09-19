@@ -28,6 +28,20 @@ func TestSecurityEvalFlagAppliesInstruction(t *testing.T) {
 	if got := securityPersonaInstruction(); got != security.InstructionExtreme {
 		t.Fatalf("depth extreme: instruction = %q, want InstructionExtreme", got)
 	}
+	t.Setenv(EnvSecurityDepth, "typo")
+	if _, err := security.InstructionForDepth("typo"); err == nil {
+		t.Fatal("unknown depth must error")
+	}
+	// OptionsFromEnv validates depth before any review; a late typo here
+	// panics so a mistyped DEPTH cannot silently measure deep.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("securityPersonaInstruction must panic on a depth typo while the flag is on")
+			}
+		}()
+		_ = securityPersonaInstruction()
+	}()
 	t.Setenv(EnvSecurity, "0")
 	if got := securityPersonaInstruction(); got != "" {
 		t.Fatalf("flag off: instruction = %q, want empty", got)
@@ -165,7 +179,7 @@ func TestSecurityPersonaFixturesAreWellFormed(t *testing.T) {
 
 // TestSecurityBakeOffIsNotLabeledAMixedHeldOutSpend pins the report header and
 // the dump name. Mutation: delete the securityCorpusToken branch and this
-// battery is labeled MIXED with three HELD-OUT fixtures, which is a
+// battery is labeled MIXED with three held-out fixtures, which is a
 // generalization claim the spent plants are no longer allowed to support.
 func TestSecurityBakeOffIsNotLabeledAMixedHeldOutSpend(t *testing.T) {
 	byName := map[string]Fixture{}
