@@ -16,6 +16,7 @@ import (
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/linters"
 	"github.com/jdziat/open-nitpick/internal/llm"
+	"github.com/jdziat/open-nitpick/internal/practices"
 	"github.com/jdziat/open-nitpick/internal/prompt"
 	"github.com/jdziat/open-nitpick/internal/review"
 	"github.com/jdziat/open-nitpick/internal/vcs"
@@ -23,6 +24,7 @@ import (
 
 // reviewFlags holds the review command's options.
 type reviewFlags struct {
+	profile     string
 	repo        string
 	configPath  string
 	base        string
@@ -60,6 +62,7 @@ func reviewWithScope(ctx context.Context, name string, args []string, scope func
 	var slop bool
 
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.StringVar(&f.profile, "profile", "", "opt-in engineering assessment profile")
 	fs.StringVar(&f.repo, "repo", ".", "repository root")
 	fs.StringVar(&f.configPath, "config", "", "path to .nitpick.yaml (default: <repo>/.nitpick.yaml)")
 	fs.StringVar(&f.base, "base", "", "base revision (default: review uncommitted changes)")
@@ -95,6 +98,9 @@ func reviewWithScope(ctx context.Context, name string, args []string, scope func
 
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if f.profile != "" && f.profile != "engineering" {
+		return fmt.Errorf("unknown profile %q", f.profile)
 	}
 
 	// Go's flag package stops at the first non-flag argument and leaves the
@@ -151,9 +157,19 @@ func reviewWithScope(ctx context.Context, name string, args []string, scope func
 	// trusted to supply them. Saying so matters: an ignored base_url that
 	// nobody mentions looks exactly like a bug.
 	if len(cfg.Dropped) > 0 {
-		log.Warn("ignored endpoint settings from an untrusted config file",
+		log.Warn("ignored settings an untrusted config file may not supply",
 			"keys", strings.Join(cfg.Dropped, ", "),
 			"hint", "set "+config.EnvTrustConfigEndpoints+"=1 if you control this file")
+	}
+
+	// Keys this build does not have, ignored on the operator's word that their
+	// binary is behind their config. Worth a line whether or not they were
+	// right: if they were not, the key is a typo doing nothing.
+	if len(cfg.Unknown) > 0 {
+		log.Warn("ignored config keys this version does not know",
+			"keys", strings.Join(cfg.Unknown, ", "),
+			"version", version,
+			"hint", "unset "+config.EnvIgnoreUnknownKeys+" to make these fail the run again")
 	}
 
 	// A config file that is not there is the one outcome this command used to
@@ -186,20 +202,19 @@ func reviewWithScope(ctx context.Context, name string, args []string, scope func
 
 	actions := actionsFromEnv()
 
-	if ref.Number > 0 {
-		pr, err := provider.PullRequest(ctx, ref)
-		if err != nil {
-			return err
-		}
-		if reason := skipReason(pr, f.skipDraft, cfg.Review.SkipMarkers); reason != "" {
-			fmt.Fprintln(os.Stderr, reason)
-			actions.setOutputs(resultSkipped, nil)
-			actions.writeSummary(resultSkipped, nil, nil, ref, reason)
-			return nil
-		}
+	// Operator configuration errors must surface even when accepted policy skips the PR.
+	engine, err := newEngine(ctx, &f, repo, cfg, provider, ref, log)
+	if err != nil {
+		return err
 	}
 
-	report, err := newEngine(&f, repo, cfg, provider, log).Review(ctx, ref)
+	report, err := engine.Review(ctx, ref)
+	if err == nil && report.Skipped != "" {
+		fmt.Fprintln(os.Stderr, report.Skipped)
+		actions.setOutputs(resultSkipped, nil)
+		actions.writeSummary(resultSkipped, nil, nil, ref, report.Skipped)
+		return nil
+	}
 	var note string
 	switch {
 	case err == nil:
@@ -236,10 +251,25 @@ func reviewWithScope(ctx context.Context, name string, args []string, scope func
 	actions.setOutputs(result, report)
 	actions.writeSummary(result, report, &rendered, ref, note)
 
-	if result == resultFindings {
+	return exitFor(result)
+}
+
+// exitFor turns a classification into the error the process exits on.
+//
+// A function rather than a switch inline, because the mapping is the contract
+// every command shares and the only part of it a test can reach without a
+// forge, a model and a diff. Called after the outputs are written, never
+// instead: the findings a degraded run did produce are worth reading, and what
+// must not happen is the run reporting itself finished.
+func exitFor(result actionResult) error {
+	switch result {
+	case resultFindings:
 		return errFindings
+	case resultError:
+		return errIncomplete
+	default:
+		return nil
 	}
-	return nil
 }
 
 // skipReason says why a pull request is not reviewed, or "" when it is:
@@ -264,26 +294,54 @@ func skipReason(pr *vcs.PullRequest, skipDraft bool, markers []string) string {
 // driver has no base revision to resolve against), so neither omission is a
 // build error, and a test can only pin them by constructing what the command
 // constructs.
-func newEngine(f *reviewFlags, repo string, cfg *config.Config, provider vcs.Provider, log *slog.Logger) *review.Engine {
-	engine := &review.Engine{
-		Config:   cfg,
-		Provider: provider,
-		Log:      log,
-
-		// A change may not supply the policy it is reviewed under. Wired here
-		// rather than defaulted inside the engine because only this layer knows
-		// the checkout the diff's paths are relative to and which forge resolves
-		// revisions.
-		Policy: &config.BasePolicy{RepoRoot: repo, Loaded: cfg, Provider: provider},
-
-		// Built from the policy the engine resolved, never from the file on
-		// disk: models.* names the model, its temperature and its token ceiling,
-		// so clients built here from cfg would let a change that edits.
-		// nitpick.yaml still choose what reviews it.
-		Models: func(policy *config.Config) (*llm.Roles, error) { return llm.BuildRoles(policy) },
-
-		Instruction: f.instruction,
+// newEngine builds the engine every command reviews through, retrieval
+// included.
+//
+// The retriever is built HERE rather than by each caller, and that is the
+// point of the signature carrying a context and an error. Wired per command it
+// reached one of them: `nitpick review` had it and full-review, slop, the MCP
+// tools and improve did not, so `review.knowledge: true` meant four different
+// things depending on which command read it. A new entry point now gets
+// retrieval by construction instead of by remembering.
+func newEngine(ctx context.Context, f *reviewFlags, repo string, cfg *config.Config, provider vcs.Provider, ref vcs.Ref, log *slog.Logger) (*review.Engine, error) {
+	// A change may not supply the policy it is reviewed under, and the models
+	// are built from the policy the engine resolved rather than the file on
+	// disk: models.* names the model, its temperature and its token ceiling, so
+	// clients built here from cfg would let a change that edits .nitpick.yaml
+	// still choose what reviews it. Both are arguments rather than fields
+	// because a review without them means something other than a review.
+	engine := review.NewEngine(cfg, provider,
+		&config.BasePolicy{RepoRoot: repo, Loaded: cfg, Provider: provider},
+		llm.BuildRoles,
+		log)
+	var usage engineeringUsage
+	buildModels := engine.Models
+	engine.Models = func(policy *config.Config) (*llm.Roles, error) {
+		usage.reset()
+		roles, err := buildModels(policy)
+		if err == nil && (f.profile == "engineering" || policy.Practices.Profile == "engineering") {
+			usage.attach(roles)
+		}
+		return roles, err
 	}
+	engine.ModelUsage = usage.snapshot
+	engine.Instruction = f.instruction
+	engine.Policy = &engineeringReviewPolicy{source: engine.Policy, loaded: cfg, explicit: f.profile == "engineering", selected: func() {
+		engine.Instruction = engineeringPrompt + "\n" + f.instruction
+		engine.Full = true
+	}}
+	engine.AssessPractices = func(ctx context.Context, ref vcs.Ref, pr *vcs.PullRequest, report *review.Report) *practices.Report {
+		accepted := report.Policy.Config
+		if accepted == nil {
+			return &practices.Report{SchemaVersion: practices.SchemaVersion, Profile: "engineering"}
+		}
+		if f.profile != "engineering" && accepted.Practices.Profile != "engineering" {
+			return nil
+		}
+		return assessReviewPractices(ctx, repo, accepted, ref, pr, report, engine.Provider)
+	}
+	engine.SkipDraft = f.skipDraft
+	engine.Full = f.full
 
 	// Built per review from the resolved policy for the same reason. The
 	// analyzers read review.ignore themselves, so a change that edits.
@@ -298,7 +356,41 @@ func newEngine(f *reviewFlags, repo string, cfg *config.Config, provider vcs.Pro
 		}
 	}
 
-	return engine
+	// Retrieval is built from the file on disk rather than the resolved
+	// policy, and deliberately: it reads models.embed, which the trust prune
+	// strips from a repository's own file, so a change cannot point the
+	// embedder at an endpoint of its own. A misconfiguration is fatal here
+	// because the operator asked for retrieval; a failure to retrieve during a
+	// review is not, and lands on the report instead.
+	k, status, err := review.BuildKnowledge(ctx, cfg, repo, log)
+	if err != nil {
+		return nil, fmt.Errorf("knowledge retrieval (%s): %w", status.Reason, err)
+	}
+	engine.Knowledge = k
+
+	// The conventions this repository was measured to follow, counted at the
+	// base revision so the change cannot supply the standard it is reviewed
+	// against. Resolved here rather than inside the engine because this layer
+	// knows the checkout git can be run in; without one the run says so.
+	engine.Standards, engine.StandardsStatus = review.BuildStandards(ctx, cfg, repo,
+		baseRevisionFor(ctx, provider, ref, log), log)
+
+	return engine, nil
+}
+
+// baseRevisionFor resolves the revision a measurement should read, empty when
+// the provider cannot name one.
+//
+// Empty rather than an error: BuildStandards turns it into a skip with a
+// reason on the report, and a review that worked without a convention
+// measurement should not fail for want of one.
+func baseRevisionFor(ctx context.Context, provider vcs.Provider, ref vcs.Ref, log *slog.Logger) string {
+	rev, err := vcs.BaseRevision(ctx, provider, ref)
+	if err != nil {
+		log.Debug("no base revision for the convention measurement", "error", err)
+		return ""
+	}
+	return rev
 }
 
 // gate returns the severity that decides this run's exit status: the
@@ -369,14 +461,20 @@ func printOverruled(report *review.Report) {
 
 	fmt.Fprintf(os.Stderr, "%d finding(s) withheld after a domain expert disagreed:\n", len(report.Overruled))
 	for _, r := range report.Overruled {
+		cited := ""
+		if r.Cited != "" {
+			cited = fmt.Sprintf(" (citing %s)", r.Cited)
+		}
 		if r.Revised != "" {
-			fmt.Fprintf(os.Stderr, "  %s:%d %s — %s re-rated %s → %s: %s\n",
+			// A re-rating carries a citation like a refutation does, and both
+			// remove a finding from the pull request.
+			fmt.Fprintf(os.Stderr, "  %s:%d %s — %s re-rated %s → %s: %s%s\n",
 				r.Finding.Path, r.Finding.Line, r.Finding.Title, r.Expert,
-				r.Finding.Sev(), r.Revised, r.Reason)
+				r.Finding.Sev(), r.Revised, r.Reason, cited)
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "  %s:%d %s — %s: %s\n",
-			r.Finding.Path, r.Finding.Line, r.Finding.Title, r.Expert, r.Reason)
+		fmt.Fprintf(os.Stderr, "  %s:%d %s — %s: %s%s\n",
+			r.Finding.Path, r.Finding.Line, r.Finding.Title, r.Expert, r.Reason, cited)
 	}
 }
 
@@ -429,8 +527,9 @@ func githubProvider(repo string) (*vcs.GitHub, error) {
 	}
 
 	gh, err := vcs.NewGitHub(vcs.GitHubOptions{
-		Token:   token,
-		BaseURL: os.Getenv("GITHUB_API_URL"),
+		Token:    token,
+		BaseURL:  os.Getenv("GITHUB_API_URL"),
+		BotLogin: os.Getenv("NITPICK_BOT_LOGIN"),
 	})
 	if err != nil {
 		return nil, err
@@ -585,6 +684,19 @@ func runExplainConfig(args []string) error {
 	fs.StringVar(&configPath, "config", "", "path to .nitpick.yaml")
 	fs.StringVar(&forPath, "path", "", "show the instructions that apply to this file path")
 
+	// Every other flagged subcommand writes its own header, and this one is the
+	// command the documentation points at hardest: the landing page, the quick
+	// start and docs/usage.md all send a first-time operator here to see what a
+	// review would send before paying for one. Left to Go's default it was the
+	// one command in the set that printed no sentence about itself.
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: nitpick explain-config [flags]\n\n"+
+			"Prints the resolved configuration, the model each role will use, and the review prompt\n"+
+			"exactly as it will be sent. -path adds the instructions that apply to one file.\n"+
+			"No model is called, so this costs nothing.\n\nFlags:")
+		fs.PrintDefaults()
+	}
+
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -663,8 +775,20 @@ func explainConfig(w io.Writer, repo, configPath, forPath string) error {
 	// was dropped is also what makes the empty case evidence rather than the
 	// same output any config would produce.
 	if len(cfg.Dropped) > 0 {
-		pl("Ignored (untrusted config; set NITPICK_TRUST_CONFIG_ENDPOINTS=1 where you control the file):")
+		pl("Ignored (an untrusted config file may not supply these; set NITPICK_TRUST_CONFIG_ENDPOINTS=1 where you control it):")
 		for _, key := range cfg.Dropped {
+			pf("  %s\n", key)
+		}
+		b.WriteString("\n")
+	}
+
+	// The same answer for the other reason a key is not in force: this build
+	// does not have it. An operator reading "why is my setting not doing
+	// anything" gets the key, its line and the version that did not know it.
+	if len(cfg.Unknown) > 0 {
+		pf("Ignored (keys nitpick %s does not know; unset %s to make these fail the run):\n",
+			version, config.EnvIgnoreUnknownKeys)
+		for _, key := range cfg.Unknown {
 			pf("  %s\n", key)
 		}
 		b.WriteString("\n")

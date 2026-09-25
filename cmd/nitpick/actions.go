@@ -92,6 +92,31 @@ func (a actionsEnv) setOutputs(result actionResult, report *review.Report) {
 	fmt.Fprintf(&b, "findings=%d\n", total)
 	fmt.Fprintf(&b, "files=%d\n", files)
 	fmt.Fprintf(&b, "withheld=%d\n", withheld)
+	practiceFindings, practiceBlocking := 0, 0
+	if report != nil && report.Practices != nil {
+		for _, check := range report.Practices.Checks {
+			for _, finding := range check.Findings {
+				practiceFindings++
+				if finding.Blocking && finding.Exception == "" && finding.Uncertainty == "" {
+					practiceBlocking++
+				}
+			}
+		}
+	}
+	fmt.Fprintf(&b, "practice_findings=%d\npractice_blocking=%d\n", practiceFindings, practiceBlocking)
+
+	// A workflow that only reads result= sees "error" and stops, which is the
+	// point. One that wants to act on the difference between a reviewer that
+	// could not start and a reviewer whose triage died gets these two: a run
+	// with findings and complete=false published real findings that nothing
+	// ranked. A nil report has neither, and reports itself incomplete.
+	complete, stages := false, ""
+	if report != nil {
+		complete = report.PipelineComplete()
+		stages = strings.Join(report.FailedStages(), ",")
+	}
+	fmt.Fprintf(&b, "complete=%t\n", complete)
+	fmt.Fprintf(&b, "failed_stages=%s\n", stages)
 	appendFile(a.outputs, b.String())
 }
 
@@ -123,8 +148,12 @@ func (a actionsEnv) writeSummary(result actionResult, report *review.Report, ren
 	if report.Plan != nil {
 		files = report.Plan.Files()
 	}
-	fmt.Fprintf(&b, "Result: **%s** — %d file(s) reviewed, %s.\n\n", result, files, countsOr(report.Counts, "no findings"))
+	fmt.Fprintf(&b, "Result: **%s** — %d file(s) reviewed, %s.\n\n", result, files, countsOr(report.Counts, "no inline review findings"))
 
+	if report.Practices != nil && (rendered == nil || !strings.Contains(rendered.Summary, report.Practices.Text())) {
+		b.WriteString(report.Practices.Text())
+		b.WriteString("\n\n")
+	}
 	if rendered != nil && strings.TrimSpace(rendered.Summary) != "" {
 		b.WriteString(rendered.Summary)
 		b.WriteString("\n\n")
@@ -148,6 +177,9 @@ func (a actionsEnv) writeSummary(result actionResult, report *review.Report, ren
 	}
 	if len(report.Incomplete) > 0 {
 		fmt.Fprintf(&b, "**Not reviewed** (a batch failed): %s\n\n", mdCell(strings.Join(report.Incomplete, ", ")))
+	}
+	for _, st := range report.Stages {
+		fmt.Fprintf(&b, "**Stage did not complete**: %s (%s)\n\n", mdCell(st.Stage), mdCell(st.Reason))
 	}
 	if len(report.Linters) > 0 {
 		b.WriteString("<details><summary>Analyzers</summary>\n\n")
@@ -173,9 +205,21 @@ func mdCell(s string) string {
 }
 
 // resultFor classifies a finished review the way the Action's outputs do.
+//
+// Completeness is asked before severity, and it is not subject to fail-on. A
+// repository that has opted out of blocking on findings has said what it wants
+// done about the code, not that it would rather not hear its reviewer broke;
+// answering "clean" for a run whose triage never happened is the one output
+// this tool must never produce.
 func resultFor(report *review.Report, gate config.Severity) actionResult {
 	if report == nil {
 		return resultError
+	}
+	if !report.PipelineComplete() {
+		return resultError
+	}
+	if report.Practices != nil && report.Practices.ExitCode() == 1 {
+		return resultFindings
 	}
 	if report.Failed(gate) {
 		return resultFindings

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	llms "github.com/nocturnium/llm-go-sdk/v6"
 
@@ -33,6 +34,10 @@ type scriptedLLM struct {
 	// err, when set, fails every call.
 	err error
 
+	// onCall, when set, runs for every request before the answer is chosen. It
+	// exists so a test can observe how many calls are in flight at once.
+	onCall func()
+
 	// seen records every prompt sent, so a test can assert on what the model
 	// was TOLD. Asserting only on what came back would pass against a
 	// prompt still carrying an injection the model happened to ignore.
@@ -42,6 +47,15 @@ type scriptedLLM struct {
 }
 
 func (s *scriptedLLM) GenerateContent(_ context.Context, msgs []llms.Message, _ ...llms.CallOption) (*llms.Response, error) {
+	// Outside the lock, because the lock serialises every call and a hook
+	// counting requests in flight would then always see one.
+	s.mu.Lock()
+	hook := s.onCall
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -62,6 +76,15 @@ func (s *scriptedLLM) GenerateContent(_ context.Context, msgs []llms.Message, _ 
 		if strings.Contains(text, needle) {
 			return &llms.Response{Content: response}, nil
 		}
+	}
+	// A fallback is written for the review pass, and the triage pass has a
+	// different shape. Answering triage with a review-shaped reply is not a
+	// no-op: every verdict names no finding, so triage is skipped entirely and
+	// a test that meant "triage is not the subject here" has quietly stopped
+	// exercising it. An empty verdict list says the same thing truthfully, and
+	// the findings restore.
+	if strings.Contains(text, "triaging findings") && !strings.Contains(s.fallback, `"number"`) {
+		return &llms.Response{Content: `{"findings":[],"summary":""}`}, nil
 	}
 	return &llms.Response{Content: s.fallback}, nil
 }
@@ -87,7 +110,7 @@ func (s *scriptedLLM) prompts() []string {
 }
 
 // mustJSON encodes a Result as the model would return it.
-func mustJSON(t *testing.T, r Result) string {
+func mustJSON[T Result | TriageResult](t *testing.T, r T) string {
 	t.Helper()
 
 	data, err := json.Marshal(r)
@@ -172,12 +195,12 @@ func TestReviewEndToEnd(t *testing.T) {
 		Path: "app.go", Line: 4, Severity: "error", Category: "correctness",
 		Title: "Ignored error from http.Get", Rationale: "resp may be nil, so the deferred Close panics.",
 	}}})
-	triageOut := mustJSON(t, Result{
+	triageOut := mustJSON(t, TriageResult{
 		Summary: "Adds a retry path to Get.",
-		Findings: []Finding{{
+		Verdicts: verdictsFor([]Finding{{
 			Path: "app.go", Line: 4, Severity: "error", Category: "correctness",
 			Title: "Ignored error from http.Get", Rationale: "resp may be nil, so the deferred Close panics.",
-		}},
+		}}),
 	})
 
 	model := &scriptedLLM{byPrompt: map[string]string{
@@ -376,7 +399,7 @@ func TestNearMissFindingsAreSnapped(t *testing.T) {
 	}})
 
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "s", Findings: []Finding{{Path: "app.go", Line: 6, Severity: "warning", Title: "Close may panic"}}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{{Path: "app.go", Line: 6, Severity: "warning", Title: "Close may panic"}})}),
 		"Review the following changes": reviewOut,
 	}}
 	engine := newEngine(t, model, &stubProvider{diff: engineDiff}, nil)
@@ -411,37 +434,12 @@ func TestInvalidFindingsAreDiscarded(t *testing.T) {
 	}
 }
 
-func TestTriageCannotInventFindingsForOtherFiles(t *testing.T) {
-	// Triage may merge and reword, but a summarizing model must not be able to
-	// place comments on files nobody reported on.
-	reviewOut := mustJSON(t, Result{Findings: []Finding{
-		{Path: "app.go", Line: 4, Severity: "warning", Title: "Real finding"},
-	}})
-	triageOut := mustJSON(t, Result{
-		Summary: "ok",
-		Findings: []Finding{
-			{Path: "app.go", Line: 4, Severity: "warning", Title: "Real finding"},
-			{Path: "/etc/passwd", Line: 1, Severity: "critical", Title: "Invented"},
-		},
-	})
-
-	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            triageOut,
-		"Review the following changes": reviewOut,
-	}}
-	engine := newEngine(t, model, &stubProvider{diff: engineDiff}, nil)
-
-	report, err := engine.Review(context.Background(), vcs.Ref{})
-	if err != nil {
-		t.Fatalf("Review: %v", err)
-	}
-	for _, f := range report.Findings {
-		if f.Path != "app.go" {
-			t.Errorf("triage invented a finding for %q", f.Path)
-		}
-	}
-}
-
+// A triage pass could once place a comment on a file nobody reported on, by
+// returning a finding with a path of its own. TestTriageCannotInventFindingsForOtherFiles
+// guarded that. A verdict carries no path: it names a finding by its number
+// and the engine publishes its own object, so there is no longer a way to
+// express the claim the test refuted. Deleted rather than rewritten, because a
+// test of an inexpressible state asserts nothing.
 func TestMinSeverityGate(t *testing.T) {
 	out := mustJSON(t, Result{Summary: "s", Findings: []Finding{
 		{Path: "app.go", Line: 4, Severity: "nit", Title: "A nit"},
@@ -496,6 +494,40 @@ func TestTriageFailureStillPublishesFindings(t *testing.T) {
 	}
 	if len(report.Findings) != 1 {
 		t.Errorf("findings = %+v, want the review findings to survive", report.Findings)
+	}
+
+	// The half that was missing. Surviving the failure is right; reporting the
+	// pipeline finished is what made a dead triage read as a clean review.
+	if report.PipelineComplete() {
+		t.Error("PipelineComplete() = true after triage failed")
+	}
+	if !report.Complete() {
+		t.Error("Complete() = false; triage failing is not a file going unread")
+	}
+	if got := report.FailedStages(); len(got) != 1 || got[0] != "triage" {
+		t.Errorf("FailedStages() = %v, want [triage]", got)
+	}
+	// The reason is this code's own word, not the model's answer, because it
+	// reaches a pull request comment.
+	if r := report.Stages[0].Reason; r == "" || strings.Contains(r, "not json") {
+		t.Errorf("Stages[0].Reason = %q, want a sanitized kind", r)
+	}
+}
+
+// A clean review never calls triage at all, so there is no stage to fail. If
+// the skip started reporting one, every clean review would exit 2.
+func TestACleanReviewRecordsNoStageFailure(t *testing.T) {
+	model := &scriptedLLM{byPrompt: map[string]string{
+		"Review the following changes": mustJSON(t, Result{Findings: nil}),
+	}}
+	engine := newEngine(t, model, &stubProvider{diff: engineDiff}, nil)
+
+	report, err := engine.Review(context.Background(), vcs.Ref{})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !report.PipelineComplete() {
+		t.Errorf("PipelineComplete() = false on a clean review; stages = %+v", report.Stages)
 	}
 }
 
@@ -645,7 +677,7 @@ func TestDedupeCollapsesIdenticalFindings(t *testing.T) {
 	}
 }
 
-func TestCountsRendering(t *testing.T) {
+func TestCountsRenderingIncludesSeverityTotals(t *testing.T) {
 	c := counts([]Finding{
 		{Severity: "error"}, {Severity: "error"}, {Severity: "nit"},
 	})
@@ -729,5 +761,71 @@ func TestPublishedProseIsScrubbed(t *testing.T) {
 	}
 	if strings.HasPrefix(report.Summary, "Sure!") || strings.Contains(report.Summary, "actually") {
 		t.Errorf("summary = %q", report.Summary)
+	}
+}
+
+// The style pass runs beside the defect review, not after it.
+//
+// It reads the plan and not the findings, so nothing in it depended on the
+// review it used to wait for. Issue #81, cause 4: a one-batch change could not
+// use its configured concurrency because every stage was serial.
+func TestTheStylePassRunsBesideTheReview(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		inFlight int
+		peak     int
+	)
+	model := &scriptedLLM{fallback: `{"findings":[]}`, onCall: func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+	}}
+
+	engine := newEngine(t, model, &stubProvider{diff: engineDiff}, nil)
+	engine.Config.Persona.Nitpick = config.NitpickPedantic
+	engine.Config.Review.Concurrency = 4
+
+	if _, err := engine.Review(context.Background(), vcs.Ref{}); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if peak < 2 {
+		t.Errorf("peak in-flight calls = %d, want the style pass overlapping the review", peak)
+	}
+	// And the shared bound holds: two semaphores would have allowed eight.
+	if peak > 4 {
+		t.Errorf("peak in-flight calls = %d, above review.concurrency of 4", peak)
+	}
+}
+
+// A long pull request body is measured, not allowed for.
+//
+// The body is whatever its author wrote, so a flat allowance is a number that
+// is right until someone writes a long one, and the budget it protects is what
+// keeps a request inside the model's input window.
+func TestTheFramingReserveGrowsWithThePullRequestBody(t *testing.T) {
+	engine := newEngine(t, &scriptedLLM{fallback: `{"findings":[]}`}, &stubProvider{diff: engineDiff}, nil)
+
+	short := engine.framingTokens(&vcs.PullRequest{Title: "t", Body: "short"})
+	long := engine.framingTokens(&vcs.PullRequest{
+		Title: "t",
+		Body:  strings.Repeat("a paragraph of release notes nobody trimmed. ", 400),
+	})
+
+	if long <= short {
+		t.Errorf("a long body reserved %d tokens and a short one %d; the body is not being measured", long, short)
+	}
+	// And a nil pull request is not a panic: the local driver has none.
+	if engine.framingTokens(nil) <= 0 {
+		t.Error("a run with no pull request reserved nothing for its system prompt")
 	}
 }

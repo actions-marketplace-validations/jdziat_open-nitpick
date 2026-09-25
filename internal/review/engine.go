@@ -22,7 +22,9 @@ import (
 	"github.com/jdziat/open-nitpick/internal/bundle"
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/diff"
+	"github.com/jdziat/open-nitpick/internal/fence"
 	"github.com/jdziat/open-nitpick/internal/llm"
+	"github.com/jdziat/open-nitpick/internal/practices"
 	"github.com/jdziat/open-nitpick/internal/prompt"
 	"github.com/jdziat/open-nitpick/internal/vcs"
 )
@@ -30,6 +32,12 @@ import (
 // Engine reviews changes. It is the library the CLI drives, and the same one a
 // future webhook server would drive.
 type Engine struct {
+	// AssessPractices attaches engineering evidence before rendering and gating.
+	// Nil leaves the existing review policy in control.
+	AssessPractices func(context.Context, vcs.Ref, *vcs.PullRequest, *Report) *practices.Report
+	// ModelUsage reads the optional per-run provider usage meter after model work.
+	ModelUsage func() []practices.ModelUsage
+
 	Config   *config.Config
 	Roles    *llm.Roles
 	Provider vcs.Provider
@@ -48,6 +56,20 @@ type Engine struct {
 	// have a substituted policy applied to them, and is refused rather than
 	// reviewed under half of one.
 	Models func(policy *config.Config) (*llm.Roles, error)
+
+	// Knowledge retrieves the entries a batch should be judged against. Nil
+	// when review.knowledge is off or no models.embed is configured, which is
+	// the shipped state: this is an option a repository turns on, not a
+	// default it inherits.
+	Knowledge *KnowledgeRetriever
+
+	// Standards is what this repository was measured to do, at the base
+	// revision. Nil is off, which is not the same as a repository with no
+	// conventions; StandardsStatus says which.
+	Standards *StandardsRef
+
+	// StandardsStatus records what the measurement did, and reaches the report.
+	StandardsStatus StandardsStatus
 
 	// routeDecisions is where each batch of the last review went; copied
 	// into the Report.
@@ -71,6 +93,12 @@ type Engine struct {
 
 	// Instruction is an extra instruction for this run only.
 	Instruction string
+
+	// SkipDraft is the operator flag for leaving draft pull requests alone.
+	SkipDraft bool
+
+	// Full bypasses incremental history on an explicit operator request.
+	Full bool
 }
 
 // LinterRunner produces deterministic findings for the changed files.
@@ -266,7 +294,7 @@ const (
 	// version below the toolchain analyzing it, so the version-gated part of the
 	// ruleset was not applied to it. It is the one reason here that is a REDUCED
 	// analysis rather than an absent one: the file was read, and part of the
-	// ruleset was held off it. See linters.belowAnalyzedLanguage for what the
+	// ruleset was held off it. See gomod.BelowAnalyzed for what the
 	// ceiling is and why it is not a fixed floor.
 	//
 	// It says the gate was CLOSED, not that anything was behind it, and the
@@ -306,6 +334,15 @@ type LinterStatus struct {
 	// "isolated" or "operator config <path>" when it ran, and the reason
 	// otherwise.
 	State string
+
+	// NoTargets is true when Outcome is Skipped because the analyzer had no
+	// files of its kind in the selection. Callers must use this flag rather
+	// than substring-matching State.
+	NoTargets bool
+
+	// GosecEnabled is true when golangci-lint ran with gosec forced on.
+	// Security roster completeness must read this flag, not State prose.
+	GosecEnabled bool
 }
 
 // LinterOutcome is what happened to one analyzer.
@@ -333,6 +370,18 @@ const (
 
 // Report is the outcome of a review.
 type Report struct {
+	// Practices records selected engineering checks alongside the code review.
+	Practices *practices.Report
+	// ModelUsage retains reported usage independently of findings and gating.
+	ModelUsage []practices.ModelUsage
+	// PullRequest pins the metadata used for commit and title checks.
+	PullRequest *vcs.PullRequest
+	// AnalyzerFindings preserves deterministic evidence before model triage.
+	AnalyzerFindings []Finding
+
+	// Skipped names the accepted policy decision that prevented a review.
+	Skipped string
+
 	// Findings are the published findings, most severe first.
 	Findings []Finding
 
@@ -368,6 +417,19 @@ type Report struct {
 	// configuration instead of through a failure.
 	Budget *Fit
 
+	// Knowledge is what retrieval did on this run: off, active, skipped or
+	// failed, with the counts behind it.
+	//
+	// On the report rather than the log because a measurement reads reports.
+	// An arm whose embedder refused every batch produced a review without
+	// retrieval, and scoring it as the retrieval-on treatment measures the
+	// control twice.
+	Knowledge KnowledgeStatus
+
+	// Standards is what the convention measurement did on this run: off,
+	// active or skipped, with a reason.
+	Standards StandardsStatus
+
 	// Escalated records the batches a fallback model reviewed after the
 	// primary could not, so a reader can tell which findings came from which
 	// model. Silence here would put a weaker model's findings beside a
@@ -379,6 +441,16 @@ type Report struct {
 	// them is a correctness requirement: a partially-failed review that prints
 	// "no issues found" is indistinguishable from a clean one.
 	Incomplete []string
+
+	// Stages names a required stage that did not complete, in the order the
+	// run met them.
+	//
+	// A stage failure is not a file failure. The files were read and the
+	// findings are real; what is missing is work done over them, so counting a
+	// dead triage as an unreviewed file would understate coverage and misname
+	// what broke. Kept apart from Incomplete for that reason: a reader given a
+	// list of paths should be able to open every one of them.
+	Stages []StageStatus
 
 	// Policy records the configuration this review ran under, and whether that
 	// is the change's own. Callers gate on it rather than on the configuration
@@ -444,15 +516,73 @@ type Incremental struct {
 	// ones it did not, because nothing in them moved since Since.
 	Reviewed  []string
 	Unchanged []string
+
+	// Recheck means standing findings required another review of the whole change.
+	Recheck bool
+}
+
+// StageStatus records a required stage that did not complete.
+type StageStatus struct {
+	// Stage is the stage's name as a reader knows it: "triage", "style".
+	Stage string
+
+	// Reason is a short kind, not the provider's answer. What a model or a
+	// gateway returns on failure is untrusted text bound for a pull request
+	// comment, and a status line is the wrong place to learn that.
+	Reason string
 }
 
 // Complete reports whether every planned file was reviewed.
+//
+// File coverage only. A run whose triage died read every file it planned to,
+// and evals and the tree scorecard both phrase this one as a count of files.
 func (r *Report) Complete() bool { return len(r.Incomplete) == 0 }
 
+// PipelineComplete reports whether the selected policy's required work completed.
+// Engineering profiles use per-check completion requirements; ordinary reviews
+// require every planned file and stage. Optional failures remain in the report.
+func (r *Report) PipelineComplete() bool {
+	if r.Practices != nil {
+		return r.Practices.ExitCode() != 2
+	}
+	return r.Complete() && len(r.Stages) == 0
+}
+
+// reusableCoverage requires completed work for every file the policy included.
+func (r *Report) reusableCoverage() bool {
+	if !r.PipelineComplete() {
+		return false
+	}
+	if r.Plan != nil {
+		for _, skip := range r.Plan.Skipped {
+			switch skip.Reason {
+			case bundle.ReasonIgnored, bundle.ReasonGenerated, bundle.ReasonBinary, bundle.ReasonDeleted, bundle.ReasonNoChanges:
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// FailedStages names the stages that did not complete, for an output that
+// carries one line.
+func (r *Report) FailedStages() []string {
+	out := make([]string, 0, len(r.Stages))
+	for _, s := range r.Stages {
+		out = append(out, s.Stage)
+	}
+	return out
+}
+
 // Failed reports whether the run should exit non-zero under the configured
-// gate.
+// gate. An attached practices report owns the gate, including advisory model
+// findings; otherwise failOn applies to the review findings.
 func (r *Report) Failed(failOn config.Severity) bool {
-	for _, f := range r.Findings {
+	if r.Practices != nil {
+		return r.Practices.ExitCode() != 0
+	}
+	for _, f := range append(append([]Finding(nil), r.Findings...), r.AlreadyReported...) {
 		if f.Sev().AtLeast(failOn) {
 			return true
 		}
@@ -469,6 +599,14 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	pr, err := e.Provider.PullRequest(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("read pull request: %w", err)
+	}
+
+	if ref.Number > 0 {
+		if pr.HeadSHA == "" {
+			return nil, errors.New("review: pull request has no head revision")
+		}
+		ref = ref.At(pr.HeadSHA)
+		ref.Base = pr.BaseSHA
 	}
 
 	raw, err := e.Provider.Diff(ctx, ref)
@@ -506,6 +644,19 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		return nil, err
 	}
 
+	if ref.Number > 0 {
+		reason := ""
+		if e.SkipDraft && pr.Draft {
+			reason = "Draft pull request; not reviewed."
+		}
+		if marker, ok := vcs.SkipRequested(pr, policy.Config.Review.SkipMarkers); ok {
+			reason = fmt.Sprintf("Pull request carries %s; not reviewed.", marker)
+		}
+		if reason != "" {
+			return &Report{Policy: policy, Head: pr.HeadSHA, Skipped: reason}, nil
+		}
+	}
+
 	// Installed on a copy so that everything below reads the resolved policy
 	// through e.Config and e.Roles without threading it through a dozen call
 	// sites, and on a copy rather than in place, because mutating the caller's
@@ -524,7 +675,7 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	}
 	e = next
 
-	report := &Report{Policy: policy, Incomplete: unrenderable, Head: pr.HeadSHA}
+	report := &Report{Policy: policy, Incomplete: unrenderable, Head: pr.HeadSHA, PullRequest: pr}
 	defer func() { report.Routes = e.routeDecisions }()
 
 	// What an earlier run left on the pull request, read after the policy is
@@ -533,6 +684,9 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// and the whole change is reviewed, which is also what happens on a first
 	// run.
 	prior := e.priorReview(ctx, ref)
+	if prior != nil {
+		report.PriorComments = len(prior.Comments)
+	}
 	files, report.Incremental = e.narrowToChangedSince(ctx, ref, pr, files, prior)
 	report.Files = files
 
@@ -540,7 +694,12 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		return e.Provider.FileContent(ctx, ref, path)
 	}
 
-	plan, err := bundle.AssembleWith(ctx, e.Config, files, fetch, bundle.ListerFrom(e.Provider, ref))
+	// The framing is measured rather than guessed: the system prompt is built
+	// before the plan and does not depend on it, so what it costs is known
+	// here. A budget that bounded only the entries let a request estimated at
+	// 24,852 tokens reach the provider at 32,653.
+	plan, err := bundle.AssembleReserving(ctx, e.Config, files, fetch,
+		bundle.ListerFrom(e.Provider, ref), bundle.Reserve{Tokens: e.framingTokens(pr)})
 	if err != nil {
 		return nil, fmt.Errorf("assemble review: %w", err)
 	}
@@ -565,28 +724,51 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	if len(plan.Batches) == 0 {
 		e.log().Info("nothing to review")
 		report.Counts = counts(nil)
+		report.Knowledge = e.Knowledge.Status()
+		report.Standards = e.StandardsStatus
 		return report, e.publish(ctx, ref, report, files)
 	}
 
-	findings, unreviewed, escalated, err := e.analyze(ctx, pr, plan)
+	// One bound across both passes. They run together below, and two
+	// semaphores would have let a pedantic review put twice review.concurrency
+	// requests in flight against a provider that was told four.
+	sem := make(chan struct{}, max(1, e.Config.Review.Concurrency))
+
+	// Pedantic wants findings the generation scope deliberately does not
+	// produce, and a filter can only narrow. They come from a separate pass so
+	// the defect hunt is never diluted by the style hunt.
+	//
+	// Concurrent with it, because the style pass reads the plan and not the
+	// defect findings: nothing in it depends on the review it used to wait
+	// for. Triage still follows both, and always will, since it summarises
+	// what they found.
+	var (
+		style    []Finding
+		styleErr error
+		styleWG  sync.WaitGroup
+	)
+	if e.Config.Persona.Nitpick.NeedsStylePass() {
+		styleWG.Add(1)
+		go func() {
+			defer styleWG.Done()
+			style, styleErr = e.analyzeStyle(ctx, pr, plan, sem)
+		}()
+	}
+
+	findings, unreviewed, escalated, err := e.analyze(ctx, pr, plan, sem)
+	styleWG.Wait()
 	if err != nil {
 		return nil, err
 	}
 	report.Incomplete = append(report.Incomplete, unreviewed...)
 	report.Escalated = append(report.Escalated, escalated...)
 
-	// Pedantic wants findings the generation scope deliberately does not
-	// produce, and a filter can only narrow. They come from a separate pass so
-	// the defect hunt above is never diluted by the style hunt.
-	if e.Config.Persona.Nitpick.NeedsStylePass() {
-		style, err := e.analyzeStyle(ctx, pr, plan)
-		if err != nil {
-			e.log().Warn("style pass failed; the review is complete for defects "+
-				"but style findings are missing", "error", err)
-			report.Incomplete = append(report.Incomplete, stylePassMarker)
-		}
-		findings = append(findings, style...)
+	if styleErr != nil {
+		e.log().Warn("style pass failed; the review is complete for defects "+
+			"but style findings are missing", "error", styleErr)
+		report.Stages = append(report.Stages, StageStatus{Stage: "style", Reason: errorKind(styleErr)})
 	}
+	findings = append(findings, style...)
 
 	// Collected across every stage that can drop an analyzer finding, not just
 	// the first one. See the assembly below.
@@ -598,10 +780,13 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// paths the change asked it to.
 	if runner := e.linters(); runner != nil {
 		lint, err := runner.Run(ctx, files)
+		report.AnalyzerFindings = append([]Finding(nil), lint...)
 		if err != nil {
-			// Linters are evidence, not a gate. Losing the whole review
-			// because a linter misbehaved would be a bad trade.
+			// Preserve findings even when strict mode requires a failed exit.
 			e.log().Warn("linters failed", "error", err)
+			if e.Config.Linters.Mode == config.LinterStrict {
+				report.Stages = append(report.Stages, StageStatus{Stage: "analyzers", Reason: "a required analyzer failed"})
+			}
 		}
 		// Read after Run and regardless of its error: the statuses are how the
 		// analyzers were configured and which of them did not run, which is
@@ -638,7 +823,13 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	findings, advisories := holdAdvisories(dedupe(findings))
 
 	summary, findings, withheldByTriage, err := e.triage(ctx, pr, findings)
-	if err != nil {
+	switch {
+	case errors.Is(err, errStageDegraded):
+		// Usable output behind a failed stage. The findings publish and the
+		// report says the stage did not run, which is what stops a caller
+		// downstream from reading this as a clean review.
+		report.Stages = append(report.Stages, StageStatus{Stage: "triage", Reason: errorKind(err)})
+	case err != nil:
 		return nil, err
 	}
 	// The summary was written over what triage saw, which the advisories
@@ -677,7 +868,8 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// unplaceable finding is ever paid for. It runs before the gate because a
 	// severity verdict has to be able to move a finding across the gate's
 	// threshold in either direction.
-	findings, overruled := e.validateFindings(ctx, findings, plan)
+	findings, overruled, validationFailures := e.validateFindings(ctx, findings, plan)
+	report.Stages = append(report.Stages, validationFailures...)
 	findings = append(findings, advisories...)
 
 	// After every pass that can raise a severity, and before the gate reads
@@ -691,10 +883,16 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// After the gate, so what is counted as "already posted" is what would
 	// otherwise have been posted, and nothing below min_severity is.
 	findings, report.AlreadyReported = withholdAlreadyReported(findings, prior)
-	if prior != nil {
-		report.PriorComments = len(prior.Comments)
+	if report.reusableCoverage() {
+		report.Superseded = e.superseded(ctx, ref, prior, report.Incremental, findings, report.AlreadyReported, plan.Skipped)
+		// A clean completed run under review.approve must not leave its own
+		// earlier threads open: reviewEvent refuses APPROVE while any stand,
+		// and a reader who sees COMMENT beside "0 findings" has no reason to
+		// trust the next push will close them either.
+		if more := e.resolveClearedForApprove(ctx, ref, prior, report, findings, plan.Skipped); len(more) > 0 {
+			report.Superseded = append(report.Superseded, more...)
+		}
 	}
-	report.Superseded = e.superseded(ctx, ref, prior, report.Incremental, findings, report.AlreadyReported)
 
 	// Triage's drops are disclosed exactly as an expert's refutations are:
 	// on the pull request, under "reported, then withheld", with the reason.
@@ -711,6 +909,10 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	report.Findings = findings
 	report.Summary = summary
 	report.Counts = counts(findings)
+	// Read after every batch, so the counts are the run's and not a snapshot
+	// taken before retrieval was asked for anything.
+	report.Knowledge = e.Knowledge.Status()
+	report.Standards = e.StandardsStatus
 
 	// The report is returned WITH a publish error rather than instead of it: by
 	// this point the review has happened and been paid for, and a caller that
@@ -784,7 +986,7 @@ func validateSuggestions(findings []Finding, files diff.Files) []Finding {
 // what every run did before this existed, while the cost of guessing would be
 // a review that skipped files on the strength of a request that failed.
 func (e *Engine) priorReview(ctx context.Context, ref vcs.Ref) *vcs.PriorReview {
-	if !e.Config.Review.Incremental {
+	if e.Full || !e.Config.Review.Incremental {
 		return nil
 	}
 	reader, ok := e.Provider.(vcs.PriorReviewer)
@@ -808,7 +1010,16 @@ func (e *Engine) priorReview(ctx context.Context, ref vcs.Ref) *vcs.PriorReview 
 // made the earlier head unreachable. Every one of those is a full review, and
 // the note is what tells the reader the difference.
 func (e *Engine) narrowToChangedSince(ctx context.Context, ref vcs.Ref, pr *vcs.PullRequest, files diff.Files, prior *vcs.PriorReview) (diff.Files, *Incremental) {
-	if prior == nil || prior.Head == "" || pr == nil {
+	if prior == nil || pr == nil {
+		return files, nil
+	}
+	// Standing findings force a full re-read even when the earlier run left no
+	// head to compare against: without that, superseded cannot close them and
+	// an approval would be held forever beside threads nothing re-checked.
+	if len(prior.Comments) > 0 {
+		return files, &Incremental{Since: prior.Head, Reviewed: files.Paths(), Recheck: true}
+	}
+	if prior.Head == "" {
 		return files, nil
 	}
 	if prior.Head == pr.HeadSHA {
@@ -866,7 +1077,7 @@ func (e *Engine) narrowToChangedSince(ctx context.Context, ref vcs.Ref, pr *vcs.
 // comment when the earlier revision could not be compared. Each resolved
 // thread gets a reply saying why, so a reader is not left with a silent
 // close.
-func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorReview, inc *Incremental, findings, withheld []Finding) []vcs.PriorComment {
+func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorReview, inc *Incremental, findings, withheld []Finding, skipped []bundle.Skip) []vcs.PriorComment {
 	if !e.Config.Review.ResolveSuperseded || prior == nil || inc == nil || inc.Since == "" {
 		return nil
 	}
@@ -878,6 +1089,10 @@ func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorRe
 	for _, p := range inc.Reviewed {
 		reread[p] = true
 	}
+	excluded := map[string]bool{}
+	for _, skip := range skipped {
+		excluded[skip.Path] = true
+	}
 	recurred := map[string]bool{}
 	for _, f := range append(append([]Finding(nil), findings...), withheld...) {
 		recurred[Fingerprint(f)] = true
@@ -885,7 +1100,7 @@ func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorRe
 	var candidates []vcs.PriorComment
 	var ids []int64
 	for _, c := range prior.Comments {
-		if c.ID == 0 || recurred[c.Fingerprint] {
+		if c.ID == 0 || recurred[c.Fingerprint] || excluded[c.Path] {
 			continue
 		}
 		if c.Line == 0 || reread[c.Path] {
@@ -896,7 +1111,7 @@ func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorRe
 	if len(ids) == 0 {
 		return nil
 	}
-	reply := fmt.Sprintf("Resolved by open-nitpick: the lines this pointed at changed after %s was reviewed, and the finding did not recur on the current head.", short(inc.Since))
+	reply := fmt.Sprintf("Resolved by open-nitpick: the change was reviewed again after %s, and the finding did not recur on the current head.", short(inc.Since))
 	resolved, err := resolver.ResolveThreads(ctx, ref, ids, reply)
 	if err != nil {
 		e.log().Warn("could not resolve superseded comments", "error", err, "resolved", len(resolved), "of", len(ids))
@@ -913,6 +1128,78 @@ func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorRe
 	}
 	if len(out) > 0 {
 		e.log().Info("resolved superseded comments", "count", len(out))
+	}
+	return out
+}
+
+// resolveClearedForApprove closes every earlier comment a clean approval
+// would otherwise be held beside.
+//
+// superseded already covers the incremental case. This is the remainder: a
+// completed recheck that found nothing, under review.approve, still carrying
+// threads that the line-change heuristic left alone (an empty earlier head,
+// a path that fell out of the diff, a comment whose file was reviewed but
+// whose line the forge no longer places). Without it, PriorComments stays
+// above Superseded and reviewEvent publishes COMMENT forever.
+func (e *Engine) resolveClearedForApprove(ctx context.Context, ref vcs.Ref, prior *vcs.PriorReview, report *Report, findings []Finding, skipped []bundle.Skip) []vcs.PriorComment {
+	if e.Config == nil || !e.Config.Review.Approve.Enabled || prior == nil || report == nil {
+		return nil
+	}
+	if len(findings) > 0 || len(report.AlreadyReported) > 0 || !report.Complete() {
+		return nil
+	}
+	resolver, ok := e.Provider.(vcs.ThreadResolver)
+	if !ok {
+		return nil
+	}
+	done := map[int64]bool{}
+	for _, c := range report.Superseded {
+		done[c.ID] = true
+	}
+	excluded := map[string]bool{}
+	for _, skip := range skipped {
+		excluded[skip.Path] = true
+	}
+	reread := map[string]bool{}
+	if report.Incremental != nil {
+		for _, p := range report.Incremental.Reviewed {
+			reread[p] = true
+		}
+	}
+	var candidates []vcs.PriorComment
+	var ids []int64
+	for _, c := range prior.Comments {
+		if c.ID == 0 || done[c.ID] || excluded[c.Path] {
+			continue
+		}
+		// Same eligibility as superseded: only close what this run re-read, or
+		// a comment the forge no longer places on the diff.
+		if c.Line != 0 && !reread[c.Path] {
+			continue
+		}
+		candidates = append(candidates, c)
+		ids = append(ids, c.ID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	reply := "Resolved by open-nitpick: the change was reviewed again and no findings remain."
+	resolved, err := resolver.ResolveThreads(ctx, ref, ids, reply)
+	if err != nil {
+		e.log().Warn("could not resolve comments before approval", "error", err, "resolved", len(resolved), "of", len(ids))
+	}
+	closed := map[int64]bool{}
+	for _, id := range resolved {
+		closed[id] = true
+	}
+	var out []vcs.PriorComment
+	for _, c := range candidates {
+		if closed[c.ID] {
+			out = append(out, c)
+		}
+	}
+	if len(out) > 0 {
+		e.log().Info("resolved comments before approval", "count", len(out))
 	}
 	return out
 }
@@ -940,9 +1227,8 @@ func withholdAlreadyReported(findings []Finding, prior *vcs.PriorReview) (publis
 
 // analyze reviews every batch, bounded by the configured concurrency.
 //
-// A batch that fails does not fail the run: partial review output is far more
-// useful than none, and the failure is logged and surfaced rather than hidden.
-func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.Plan) ([]Finding, []string, []Escalation, error) {
+// Partial results are published with failed batches recorded as incomplete.
+func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.Plan, sem chan struct{}) ([]Finding, []string, []Escalation, error) {
 	// Built once for the default reviewer so a prompt error surfaces before
 	// any batch runs; routed reviewers build theirs on first use.
 	if _, err := e.reviewPromptFor(e.Roles.Review); err != nil {
@@ -965,8 +1251,7 @@ func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.
 		unreviewed []string
 		decisions  []RouteDecision
 
-		wg  sync.WaitGroup
-		sem = make(chan struct{}, max(1, e.Config.Review.Concurrency))
+		wg sync.WaitGroup
 	)
 
 	// Progress is logged per batch, since a review of a large change is
@@ -1069,7 +1354,7 @@ func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.
 // is never fatal: losing style nits is a far better outcome than losing the
 // review. Findings are forced to class=style so the filter cannot be bypassed
 // by a model that ignores the instruction.
-func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bundle.Plan) ([]Finding, error) {
+func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bundle.Plan, sem chan struct{}) ([]Finding, error) {
 	p, err := prompt.Build(prompt.NameReview, prompt.Options{
 		PersonaText: prompt.StylePass(e.Config.Persona),
 		Run:         e.Instruction,
@@ -1086,7 +1371,6 @@ func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bu
 		out      []Finding
 		failures int
 		wg       sync.WaitGroup
-		sem      = make(chan struct{}, max(1, e.Config.Review.Concurrency))
 	)
 
 	for _, b := range plan.Batches {
@@ -1102,7 +1386,7 @@ func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bu
 				return
 			}
 
-			result, err := e.analyzeBatch(ctx, base, prContext, b)
+			result, err := e.analyzeBatch(ctx, base, prContext, b, true)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -1138,13 +1422,13 @@ func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bu
 
 // analyzeBatch reviews one batch.
 // analyzeBatch reviews a batch with the default review client.
-func (e *Engine) analyzeBatch(ctx context.Context, base, prContext string, b bundle.Batch) ([]Finding, error) {
-	return e.analyzeBatchWith(ctx, e.Roles.Review, base, prContext, b)
+func (e *Engine) analyzeBatch(ctx context.Context, base, prContext string, b bundle.Batch, style bool) ([]Finding, error) {
+	return e.analyzeBatchWith(ctx, e.Roles.Review, base, prContext, b, style)
 }
 
 // analyzeBatchWith reviews a batch with one client, under the prompt built
 // for it.
-func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base, prContext string, b bundle.Batch) ([]Finding, error) {
+func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base, prContext string, b bundle.Batch, style bool) ([]Finding, error) {
 	var body strings.Builder
 
 	if prContext != "" {
@@ -1155,6 +1439,30 @@ func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base,
 	for _, entry := range b.Entries {
 		body.WriteString(bundle.Render(entry))
 		body.WriteString("\n")
+	}
+
+	// After the diff, not before it. The change is what the model is being
+	// asked about, and reference material placed first reads as the subject.
+	// Widened out of the if, because the findings below carry which entries
+	// the reviewer read and the scope used to end here.
+	// Before the retrieved entries and after the diff. Six lines about how
+	// this repository writes code is the cheapest context in the prompt and
+	// the only part of it no model could have been taught.
+	if rules := e.Standards.forClasses(e.standardsClasses(style)); len(rules) > 0 {
+		body.WriteString(standardsSection(rules))
+	}
+
+	hits := e.retrieveKnowledge(ctx, b, style)
+	if len(hits) > 0 {
+		body.WriteString(knowledgeSection(hits))
+		// pool beside entries, at the level an operator runs at. A pool at or
+		// below Keep means every entry the cuts allowed reached the prompt, so
+		// nothing chose between them, which is the number docs/findings.md
+		// says a corpus grown past that point will report.
+		e.log().Info("knowledge retrieved",
+			"batch", b.Paths(),
+			"entries", ids(hits),
+			"pool", e.Knowledge.PoolSize(b, e.knowledgeClasses(style)))
 	}
 
 	msgs := []llms.Message{
@@ -1182,6 +1490,8 @@ func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base,
 		// Always this client's name: a model that writes a source of its
 		// own would let two reviewers' findings pass as one's.
 		f.Source = client.String()
+		// What the reviewer read, not what persuaded it. See evidence.go.
+		f.Evidence = evidenceFor(f, hits)
 		out = append(out, f)
 	}
 	return out, nil
@@ -1245,45 +1555,6 @@ func holdAdvisories(findings []Finding) (rest, advisories []Finding) {
 		}
 	}
 	return rest, advisories
-}
-
-// restoreSeverityProvenance puts back who reported a finding and, where it
-// still describes something, the word that reporter used, both lost by a pass
-// that decodes findings from JSON, where they carry `json:"-"`. FromAnalyzer
-// comes back for any finding still recognized, since it is a fact about origin
-// that no re-rating touches, and the other two fields follow from it.
-//
-// A model's raw word is its own rating, so a pass that moved the severity
-// leaves that word describing a rating nobody holds, and it is dropped, as
-// applyOutcomes does when an expert re-rates.
-//
-// An analyzer's raw word is what the tool printed, and semgrep printed
-// CRITICAL however triage re-rated the finding. Dropping it would publish
-// Source="semgrep(rule)" with SeverityTranslated false and no raw word,
-// asserting semgrep's word is this tool's level. SeverityTranslated is
-// likewise always true for one.
-//
-// Keying on Finding.Key() means a reworded finding keeps whatever the pass
-// said. Failing to restore prints "(word not recorded)" and is visible, where
-// restoring onto the wrong finding misquotes a reviewer.
-func (e *Engine) restoreSeverityProvenance(f *Finding, before map[string]Finding) {
-	original, ok := before[f.Key()]
-	if !ok {
-		return
-	}
-	f.FromAnalyzer = original.FromAnalyzer
-
-	if original.FromAnalyzer {
-		f.SeverityTranslated = true
-		f.RawSeverity = original.RawSeverity
-		return
-	}
-
-	if original.Severity != f.Severity {
-		return
-	}
-	f.SeverityTranslated = original.SeverityTranslated
-	f.RawSeverity = original.RawSeverity
 }
 
 // filterAnchors drops findings that cannot be placed, snaps near-misses onto a
@@ -1360,7 +1631,14 @@ func (e *Engine) filterAnchors(findings []Finding, files diff.Files) ([]Finding,
 		// Moving the anchor without dropping it means one click replaces a DIFFERENT
 		// line with that text, observed live, and it leaves the file uncompilable.
 		// The finding is still worth publishing; the fix-it button is not.
-		if f.Suggestion != "" {
+		//
+		// Reaching here once meant the anchor had moved, because the snap
+		// returned added lines and an added line is handled above. Surviving
+		// context is commentable and is not an added line, so a finding placed
+		// where the prompt asks for one now snaps to itself, and stripping on
+		// the branch alone would take the fix-it button from every
+		// removal-only finding: the shape this all exists to publish.
+		if f.Suggestion != "" && snapped != f.Line {
 			e.log().Info("dropping suggestion from a relocated finding",
 				"path", f.Path, "from", f.Line, "to", snapped, "title", f.Title)
 			f.Suggestion = ""
@@ -1421,167 +1699,129 @@ func (e *Engine) triage(ctx context.Context, pr *vcs.PullRequest, findings []Fin
 		return "", nil, nil, err
 	}
 
-	result, err := llm.Extract[Result](ctx, e.Roles.Triage, msgs, schema)
+	result, err := llm.Extract[TriageResult](ctx, e.Roles.Triage, msgs, schema)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", nil, nil, err
 		}
-		e.log().Warn("triage failed; publishing deduplicated findings", "error", err)
-		return "", findings, nil, nil
+		// The findings are kept: losing a whole review because the summarizer
+		// failed would be a bad trade. The error is kept too, which is the
+		// part that was missing. Returning nil here told Review the pipeline
+		// finished, and Review had no way to know better.
+		e.log().Warn("triage failed; publishing findings that were never triaged", "error", err)
+		return "", findings, nil, fmt.Errorf("%w: triage: %w", errStageDegraded, err)
 	}
 
-	// Triage may reword and merge, but must not invent findings for files that
-	// were never reported on. Trusting it blindly would let a summarizing model
-	// place comments on arbitrary paths.
-	allowed := make(map[string]struct{}, len(findings))
-	// classBefore preserves the class the REVIEW model assigned. Triage is a
-	// filtering pass: it may drop, merge, and reword, but it must not be able to
-	// re-author policy. Letting it do so meant a finding the reviewer classed
-	// `security` could come back `style` and be silently dropped at the default
-	// level, a real defect disappearing because a summarizer guessed.
-	classBefore := make(map[string]string, len(findings))
-	sourceBefore := make(map[string]string, len(findings))
-	// severityBefore preserves the severity PROVENANCE (the reporter's own word
-	// and the fact that we rewrote it), for the same reason sourceBefore exists.
+	// One verdict per finding, and the first verdict wins.
 	//
-	// THE BUG IT FIXES: SeverityTranslated and RawSeverity are `json:"-"`, so
-	// they arrive from triage's decode zeroed. recordSeverity below could not
-	// restore them either, because renderForTriage shows triage `[%s]` of
-	// f.Severity (this PROJECT'S word, already normalized), so a triage model
-	// that echoes what it was shown normalizes to itself and the call returns
-	// early. Every finding that survived triage was therefore published claiming
-	// nobody had translated it, and internal/evals' severityAsSaid reads that as
-	// "Severity IS the reporter's word" and quotes our substitute as the model's
-	// own, unmarked. That is verbatim the defect recordSeverity's doc comment
-	// says it fixes, one pass downstream of the fix, and it was live on the path
-	// the eval battery runs. It was worse for linter findings, because Source is
-	// deliberately restored below: the finding was published attributed to gosec
-	// with our word quoted as gosec's.
-	severityBefore := make(map[string]Finding, len(findings))
-	for _, f := range findings {
-		allowed[f.Path] = struct{}{}
-		if _, seen := classBefore[f.Key()]; !seen {
-			classBefore[f.Key()] = f.Class
-			sourceBefore[f.Key()] = f.Source
-			severityBefore[f.Key()] = f
+	// A number outside the list, or a second verdict for a number already
+	// judged, is dropped rather than guessed at: the finding it would have
+	// edited is then absent from the verdicts and comes back unchanged by the
+	// accounting below, which is the visible outcome rather than the silent
+	// one. Nothing here can move a verdict onto a finding it does not name.
+	judged := make(map[int]Verdict, len(result.Verdicts))
+	defer func() {
+		// A reply full of verdicts none of which name a finding means triage
+		// did nothing, and the review publishes exactly what the reviewer
+		// wrote. That is the right behaviour and the wrong silence: a test
+		// scripting the older shape passes on it, having exercised none of
+		// this. testUnusableVerdicts fails such a test rather than letting it
+		// go green, and is nil outside tests.
+		if testUnusableVerdicts != nil && len(result.Verdicts) > 0 && len(judged) == 0 {
+			testUnusableVerdicts(len(result.Verdicts))
 		}
-	}
-
-	// The no-new-claims contract, when it is on: every published finding
-	// carries the words the reviewer wrote, not triage's restatement of them.
-	byOrigin := origins{}
-	if e.Config.Review.TriageNoNewClaims {
-		byOrigin = originsOf(findings)
-	}
-
-	kept := make([]Finding, 0, len(result.Findings))
-	for _, f := range result.Findings {
-		if !f.Valid() {
+	}()
+	for _, v := range result.Verdicts {
+		if v.Number < 1 || v.Number > len(findings) {
+			e.log().Warn("triage judged a finding that was not in the list; ignoring it",
+				"number", v.Number, "findings", len(findings))
 			continue
 		}
-		if _, ok := allowed[f.Path]; !ok {
-			e.log().Warn("triage invented a finding for an unreported path; dropping",
-				"path", f.Path, "title", f.Title)
+		if _, seen := judged[v.Number]; seen {
+			e.log().Warn("triage judged one finding twice; keeping the first verdict", "number", v.Number)
 			continue
 		}
-		if e.Config.Review.TriageNoNewClaims {
-			origin, ok := byOrigin.find(f.Path, f.Line)
-			if !ok {
-				// A reported path, a line no reviewer reported at, and words
-				// triage wrote. That is a new claim, which is the thing the
-				// path check was always assumed to be catching and never did.
-				e.log().Warn("triage made a claim at a line no reviewer reported; dropping",
-					"at", describe(f), "title", f.Title)
-				continue
-			}
-			if changed := restore(&f, origin); len(changed) > 0 {
-				e.log().Debug("restored the reviewer's words over triage's",
-					"at", describe(f), "fields", changed)
-			}
-		}
-		e.recordSeverity(&f)
-		e.restoreSeverityProvenance(&f, severityBefore)
-
-		// Restore the reviewer's class when this finding is recognizably one it
-		// reported. Only new wording falls back to triage's guess.
-		if original, ok := classBefore[f.Key()]; ok && original != "" {
-			if f.Class != original {
-				e.log().Debug("restoring review-pass class over triage's",
-					"path", f.Path, "triage", f.Class, "review", original)
-			}
-			f.Class = original
-		}
-		f.Class = e.normalizeClass(f)
-
-		// Source must keep naming the ORIGINAL reporter, a gosec rule, or the review
-		// model. Overwriting it here made every linter finding claim to have come
-		// from the triage model, which destroys the one attribution chain this tool
-		// sells.
-		if original, ok := sourceBefore[f.Key()]; ok && original != "" {
-			f.Source = original
-		}
-		f.Triager = e.Roles.Triage.String()
-
-		kept = append(kept, f)
+		judged[v.Number] = v
 	}
 
-	// Every finding triage was given is accounted for: published, merged or
-	// reworded within a few lines of the same file, or restored. Three of eight
-	// misses on the benchmark repository were findings triage threw away as
-	// nits, and letting it drop with a stated reason only bought a
-	// rationalisation channel. So triage may not drop: it merges duplicates
-	// naming the survivor, and it re-rates. Anything else missing comes back.
-	var merged []Overruled
-	keptNumber := map[int]bool{}
-	for i, f := range findings {
-		if triageAccountedFor(f, kept) {
-			keptNumber[i+1] = true
-		}
-	}
+	// Merges, read from dropped. The survivor is the finding duplicate_of
+	// names, and it is the survivor's own object that publishes, so its
+	// attribution is its own by construction.
 	mergedInto := map[int]Drop{}
 	for _, d := range result.Dropped {
-		if d.Number >= 1 && d.Number <= len(findings) && keptNumber[d.DuplicateOf] && d.DuplicateOf != d.Number {
+		switch {
+		case d.Number < 1 || d.Number > len(findings):
+			e.log().Warn("triage merged a finding that was not in the list; ignoring it", "number", d.Number)
+		case d.DuplicateOf < 1 || d.DuplicateOf > len(findings):
+			e.log().Warn("triage merged a finding into one that was not in the list; ignoring it",
+				"number", d.Number, "into", d.DuplicateOf)
+		case d.Number == d.DuplicateOf:
+			e.log().Warn("triage merged a finding into itself; ignoring it", "number", d.Number)
+		default:
 			mergedInto[d.Number] = d
 		}
 	}
-	for i, f := range findings {
-		if keptNumber[i+1] {
+
+	// Reject merge chains and cycles: they can lose findings and analyzer attribution.
+	// Collect removals before applying them so map iteration order cannot choose
+	// which half of a cycle survives.
+	var chained []int
+	for number, d := range mergedInto {
+		if _, ok := mergedInto[d.DuplicateOf]; ok {
+			chained = append(chained, number)
+			e.log().Warn("triage merged a finding into one it also merged; keeping both",
+				"number", number, "into", d.DuplicateOf)
+		}
+	}
+	for _, number := range chained {
+		delete(mergedInto, number)
+	}
+
+	// The merges first, in their own pass. A survivor absorbs what was merged
+	// into it before anything publishes: folded in afterwards, the survivor has
+	// already been copied and the union lands on a value nobody reads.
+	var merged []Overruled
+	for i := range findings {
+		d, ok := mergedInto[i+1]
+		if !ok {
 			continue
 		}
-		if d, ok := mergedInto[i+1]; ok {
-			e.log().Debug("triage merged a finding", "path", f.Path, "line", f.Line, "into", d.DuplicateOf)
-			merged = append(merged, Overruled{Finding: f, Expert: "triage (" + e.Roles.Triage.String() + ")",
-				Reason: fmt.Sprintf("merged into the finding at %s:%d: %s", findings[d.DuplicateOf-1].Path, findings[d.DuplicateOf-1].Line, strings.TrimSpace(d.Reason))})
+		// A merged finding's evidence and attribution join the survivor's: the
+		// true sentence about a defect two reviewers reported names both of
+		// them, and picking one destroys half of it.
+		absorb(&findings[d.DuplicateOf-1], findings[i])
+		merged = append(merged, Overruled{
+			Finding: findings[i],
+			Expert:  "triage (" + e.Roles.Triage.String() + ")",
+			Reason: fmt.Sprintf("merged into the finding at %s:%d: %s",
+				findings[d.DuplicateOf-1].Path, findings[d.DuplicateOf-1].Line, strings.TrimSpace(d.Reason)),
+		})
+	}
+
+	kept := make([]Finding, 0, len(findings))
+	for i := range findings {
+		number := i + 1
+		if _, ok := mergedInto[number]; ok {
 			continue
 		}
-		e.log().Info("triage lost a finding; restoring it", "path", f.Path, "line", f.Line, "title", f.Title)
+
+		f := findings[i]
+		if v, ok := judged[number]; ok {
+			e.applyVerdict(&f, v)
+		} else {
+			// Absent from both: triage neither judged it nor merged it. Three
+			// of eight misses on the benchmark repository were findings triage
+			// threw away, so a finding it does not mention comes back as the
+			// reviewer wrote it.
+			e.log().Info("triage did not judge a finding; keeping it as reported",
+				"path", f.Path, "line", f.Line, "title", f.Title)
+		}
 		f.Triager = e.Roles.Triage.String()
 		kept = append(kept, f)
 	}
 	withheld := merged
 
 	return strings.TrimSpace(result.Summary), kept, withheld, nil
-}
-
-// triageAccountedFor reports whether a finding triage was given survives in
-// its output, allowing for the rewording and the small anchor moves a merge
-// makes. The tolerance is the anchor filter's snap distance: further than
-// that and the published finding is about something else.
-func triageAccountedFor(f Finding, kept []Finding) bool {
-	for _, k := range kept {
-		if k.Path != f.Path {
-			continue
-		}
-		if k.Line == f.Line {
-			return true
-		}
-		// A merge moves a line but not a class: two findings of different
-		// classes three lines apart are two findings.
-		if abs(k.Line-f.Line) <= 3 && k.Class == f.Class {
-			return true
-		}
-	}
-	return false
 }
 
 // capAnalyzerFindings applies linters.max_severity to the findings a
@@ -1681,9 +1921,9 @@ func FilterWith(findings []Finding, level config.NitpickLevel, minimum config.Se
 // be published, and its effect on RECALL (how many real defects an expert
 // talks itself out of) is unmeasured. Until the eval harness has measured it,
 // the honest default is not to run it.
-func (e *Engine) validateFindings(ctx context.Context, findings []Finding, plan *bundle.Plan) ([]Finding, []Overruled) {
+func (e *Engine) validateFindings(ctx context.Context, findings []Finding, plan *bundle.Plan) ([]Finding, []Overruled, []StageStatus) {
 	if !e.Config.Validation.Enabled || len(findings) == 0 {
-		return findings, nil
+		return findings, nil, nil
 	}
 	e.log().Info("validating with domain experts", "findings", len(findings))
 
@@ -1692,15 +1932,19 @@ func (e *Engine) validateFindings(ctx context.Context, findings []Finding, plan 
 		Policy:      e.Config.Validation,
 		Concurrency: e.Config.Review.Concurrency,
 		Log:         e.log(),
+		// Only when it is asked for. Reading the corpus costs nothing, but a
+		// validator holding one it will never consult reads as though targeted
+		// validation were on.
+		Corpus: e.knowledgeCorpus(),
 	}
 
-	kept, overruled := v.Validate(ctx, findings, renderedFiles(plan))
+	kept, overruled, failures := v.validateWithCoverage(ctx, findings, renderedFiles(plan))
 	if len(overruled) > 0 {
 		e.log().Info("experts overruled findings",
 			"overruled", len(overruled), "kept", len(kept), "of", len(findings))
 	}
 
-	return kept, overruled
+	return kept, overruled, failures
 }
 
 // gateOverruled keeps only the expert decisions a reader would otherwise have
@@ -1777,6 +2021,13 @@ func renderedFiles(plan *bundle.Plan) map[string]string {
 
 // publish renders and delivers the review.
 func (e *Engine) publish(ctx context.Context, ref vcs.Ref, report *Report, files diff.Files) error {
+	report.Routes = e.routeDecisions
+	if e.ModelUsage != nil {
+		report.ModelUsage = e.ModelUsage()
+	}
+	if e.AssessPractices != nil {
+		report.Practices = e.AssessPractices(ctx, ref, report.PullRequest, report)
+	}
 	e.log().Info("publishing", "findings", len(report.Findings), "provider", e.Provider.Name())
 	review := Render(report, files, e.Config)
 
@@ -1858,7 +2109,7 @@ func (e *Engine) triagePrompt() (string, error) {
 // it makes the boundary explicit to the model, and (because the text is never
 // run through text/template), a description containing {{ }} can no longer
 // abort the run either.
-const untrustedFence = "===== UNTRUSTED PULL REQUEST TEXT ====="
+const untrustedFence = fence.PullRequestText
 
 // pullRequestContext describes author intent. A change that looks wrong in
 // isolation is often correct once you know what the author set out to do, so
@@ -1905,8 +2156,13 @@ func oneLineTitle(s string) string { return strings.Join(strings.Fields(s), " ")
 func renderForTriage(pr *vcs.PullRequest, findings []Finding) string {
 	var b strings.Builder
 
+	// Flattened and defanged, as pullRequestContext does it. This is the same
+	// field, rendered a second time, into a numbered findings list the model
+	// answers against and whose entries this function flattens one loop below
+	// for that reason. It is also the one string here a contributor writes
+	// directly.
 	if pr != nil && pr.Title != "" {
-		fmt.Fprintf(&b, "Change under review: %s\n\n", pr.Title)
+		fmt.Fprintf(&b, "Change under review: %s\n\n", defang(oneLine(pr.Title)))
 	}
 
 	if len(findings) == 0 {
@@ -2061,3 +2317,67 @@ func firstPath(b bundle.Batch) string {
 	}
 	return b.Entries[0].File.Path
 }
+
+// framingTokens estimates what a request carries besides its entries.
+//
+// The system prompt and the pull request context are both measured, because
+// both are known here and neither is bounded: a body is whatever its author
+// wrote, and a flat allowance for it is a number that is right until someone
+// writes a long one.
+//
+// The schema is the remaining allowance. It is generated from a fixed set of
+// classes and varies by a little, so a constant is honest about it in a way a
+// measurement of the wrong thing would not be. An estimate that is a little
+// high costs a smaller batch; one that is low costs a request the provider
+// refuses, so this rounds the safe way.
+func (e *Engine) framingTokens(pr *vcs.PullRequest) int {
+	base, err := e.reviewPrompt()
+	if err != nil {
+		// A prompt that will not build fails later with a better message than
+		// anything this function could give. Reserve nothing and let it.
+		return 0
+	}
+	const schemaAllowance = 1200
+
+	est := llms.DefaultTokenEstimator()
+	return est.EstimateTokens(base) + est.EstimateTokens(pullRequestContext(pr)) + schemaAllowance
+}
+
+// testUnusableVerdicts is set by a test to catch a triage reply whose verdicts
+// all name nothing, which is what an unconverted fixture looks like from here.
+var testUnusableVerdicts func(verdicts int)
+
+// NewEngine builds a reviewing engine with the wiring a review cannot do
+// without: the four arguments whose absence changes what a review MEANS rather
+// than what it covers. Everything else is optional and set on the result.
+//
+// The fields stay exported, so this cannot stop anyone writing the literal.
+func NewEngine(cfg *config.Config, provider vcs.Provider, policy PolicyResolver,
+	models func(policy *config.Config) (*llm.Roles, error), log *slog.Logger) *Engine {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Engine{Config: cfg, Provider: provider, Policy: policy, Models: models, Log: log}
+}
+
+// NoPolicy is the resolver for a review with no base revision, carrying the
+// reason to the call site.
+//
+// Two constructions legitimately have none: a tree review, whose operator wrote
+// the policy, and the eval harness, which reviews fixtures with no forge behind
+// them. Both were exemptions in a map inside a test file, which is a claim
+// nobody reads where it applies.
+func NoPolicy(reason string) PolicyResolver { return noPolicy{reason: reason} }
+
+// noPolicy resolves nothing and says why.
+type noPolicy struct{ reason string }
+
+// ResolvePolicy reports that the change modified no policy, which is the
+// answer when there is no base revision to have modified one against.
+func (n noPolicy) ResolvePolicy(context.Context, vcs.Ref, *vcs.PullRequest, []string) (
+	*config.Config, bool, error) {
+	return nil, false, nil
+}
+
+// Reason names why this construction resolves no policy.
+func (n noPolicy) Reason() string { return n.reason }

@@ -66,10 +66,48 @@ models: {default: {provider: deepseek, model: deepseek-chat}}
 ```
 
 ```yaml
-# groq, cerebras, fireworks, togetherai, featherless, perplexity:
-# same shape, one line each
+# groq
 models: {default: {provider: groq, model: llama-3.3-70b-versatile}}
 ```
+
+```yaml
+# cerebras
+models: {default: {provider: cerebras, model: llama-3.3-70b}}
+```
+
+```yaml
+# fireworks
+models: {default: {provider: fireworks, model: accounts/fireworks/models/llama-v3p1-70b-instruct}}
+```
+
+```yaml
+# togetherai
+models: {default: {provider: togetherai, model: meta-llama/Llama-3.3-70B-Instruct-Turbo}}
+```
+
+```yaml
+# perplexity
+models: {default: {provider: perplexity, model: sonar-pro}}
+```
+
+```yaml
+# featherless: any model on featherless.ai, addressed by its Hugging Face path
+models: {default: {provider: featherless, model: meta-llama/Meta-Llama-3.1-70B-Instruct}}
+```
+
+```yaml
+# llamacpp: whatever the server was started with, so the name is yours
+models: {default: {provider: llamacpp, model: local}}
+```
+
+The model ids above are examples, not recommendations, and none of them has
+been measured as a reviewer here. Catalogues change faster than this file, and
+every provider in this section reaches an OpenAI-compatible endpoint, so
+`GET /v1/models` against the base URL in the table above is the current answer.
+`anthropic` and `gemini` are native APIs rather than compatible ones and answer
+their own model-list endpoints instead. The `fireworks` and
+`togetherai` ids come from the SDK's own tables; `cerebras` and `perplexity`
+were read from the vendors' documentation on 2026-09-07.
 
 Three providers need more than a name.
 
@@ -180,13 +218,12 @@ for reviewing fewer pull requests.
 
 What the measurements say, in full: Kimi-K3 with related context ties the
 shipped default, `anthropic/claude-sonnet-4.6`, on recall on both tuned
-corpora ([docs/findings.md](findings.md#kimi-k3-and-the-second-half-of-the-multi-file-corpus)),
+corpora ([Findings](findings.md#kimi-k3-and-the-second-half-of-the-multi-file-corpus)),
 and was marked down there on one column only, price per review, which is why
 it is absent from the twelve-model price table below. A flat subscription
-does not charge that column. GLM-5.3-Flash is the triage and iteration model
-this repository's own configuration uses, and with Kimi-K3 as the expert pass
-over it, noise on the tuning corpus halved at the same recall
-([docs/findings.md](findings.md#callers-2026-09-05)). Neither of those is
+does not charge that column. In the recorded GLM-5.3-Flash trial, adding
+Kimi-K3 as the expert pass halved noise on the tuning corpus at the same recall
+([Findings](findings.md#callers-2026-09-05)). Neither of those is
 a claim that Kimi-K3 is the best reviewer measured; `qwen/qwen3.8-27b` and
 `openai/gpt-5.6-luna` are, per dollar on metered pricing, and the table says
 so.
@@ -196,16 +233,22 @@ referral credit if you sign up through it. <https://synthetic.new> without it
 is the same service at the same price.
 
 `synthetic` is a provider with a compiled-in endpoint, so a committed config
-can name it and nothing else is needed:
+can name it and nothing else is needed. This repository uses GLM-5.3-Flash
+for review, Qwen3.8-27B for triage and Kimi-K3 for fixes. That role selection is
+operator policy, not a new evaluation result:
 
 ```yaml
 models:
   default:
     provider: synthetic
-    model: hf:moonshotai/Kimi-K3
+    model: hf:zai-org/GLM-5.3-Flash
   triage:
     provider: synthetic
-    model: hf:zai-org/GLM-5.3-Flash
+    model: hf:Qwen/Qwen3.8-27B
+    temperature: 0
+  fix:
+    provider: synthetic
+    model: hf:moonshotai/Kimi-K3
     temperature: 0
 ```
 
@@ -270,7 +313,7 @@ receives the code. See [Trust model](trust-model.md#trust-model).
 Twelve models were run through the shipped pipeline on all three eval corpora
 (tuning, multi-file, info; 38 planted defects) with related context on. The
 full table, per-corpus numbers and caveats are in
-[docs/comparison.md](comparison.md#twelve-models-three-corpora-the-costperformance-sweep-2026-09-04);
+[Against Incumbent](comparison.md#twelve-models-three-corpora-the-costperformance-sweep-2026-09-04);
 this is the short version. Recall is planted defects located; `$/review` is
 the provider-reported spend per pull request on those corpora. Most rows are
 a single run, so gaps under about 0.10 are inside the noise.
@@ -293,12 +336,12 @@ Incumbent's on-demand price on the same corpora is $0.25 to $0.36 a review.
 Every row was measured with `review.related_context: true`, on 2026-09-04,
 which is now the default, and without the caller walk, which is not. The
 multi-file corpus rerun with the walk on
-([docs/findings.md](findings.md#callers-2026-09-05)) cost no more per
+([Findings](findings.md#callers-2026-09-05)) cost no more per
 review than before, but the sweep itself has not been repeated.
 
 The default stays sonnet-4.6 because the sweep ran on the corpora the prompt
 was tuned against; a candidate replaces it only by beating it on the held-out
-corpus under the rule in [docs/measurement.md](measurement.md).
+corpus under the rule in [Measurement](measurement.md).
 `qwen/qwen3.8-27b` and `openai/gpt-5.6-luna` are the two worth that spend.
 
 ## Routing batches to different models, and ensembles
@@ -351,7 +394,7 @@ the model starts unpinned unless it sets `providers` itself. The report
 records where each batch went (`Report.Routes`), and `nitpick explain-config`
 shows the prompt each reviewer gets, including its model-family layer. The
 measured configurations are in `internal/evals/testdata/routes/` and their
-numbers in [docs/comparison.md](comparison.md).
+numbers in [Against Incumbent](comparison.md).
 
 ## Pinning a router to one upstream
 
@@ -393,9 +436,52 @@ answers under the cap. A runaway generation comes back cut, and the next
 attempt samples at temperature 0.3 instead of zero to break the loop; a
 review that took that path is no longer reproducible by re-running it, and
 its log says so. Every retry and its outcome is one log line, so a review
-that took forty minutes says why. This was built on gemma-4-31b through
+that took forty minutes says why.
+
+A refusal is a different loop, and until recently a silent one. A 429 or a 5xx
+is retried by the SDK, up to `max_retries` times again, with exponential
+backoff; that loop reported nothing, so a request rate limited three times and
+then answered looked in the log like one answered at once. It now writes a line
+per retry naming the attempt, the status, the delay and the provider's
+`Retry-After` when it sent one. That header is honoured as a floor and capped
+at 30 seconds, so a provider asking for longer is asked again early, and the
+line says so when it happens.
+
+Because both loops read `max_retries`, they multiply. A structured call can
+also take several passes through the schema, JSON and repair paths, so the
+requests one extraction can make is the product of the three rather than the
+largest. The default of 3 is not a small number in that arithmetic. This was built on gemma-4-31b through
 OpenRouter, which lost one review in five without it and none with it; the
-numbers are in [docs/comparison.md](comparison.md).
+numbers are in [Against Incumbent](comparison.md).
+
+A reasoning model decides for itself how long to think, and that decision is
+most of the wall clock on a slow review. One measured run spent 21,423
+reasoning tokens producing 443 tokens of findings, 298 seconds for a request
+that answered in one attempt.
+
+```yaml
+models:
+  default:
+    provider: synthetic
+    model: hf:moonshotai/Kimi-K3
+    reasoning: low     # minimal, low, medium, high, or off
+```
+
+Unset is the shipped behaviour and the only setting anything in
+[Findings](findings.md) was measured under, so this is a knob rather than a
+recommendation: less reasoning is faster and cheaper, and nothing here has
+measured what it costs in recall. Providers honour what they can. One that
+takes a token budget gets one derived from the level, one with a thinking
+switch gets the switch, and one with neither ignores it.
+
+A provider can also refuse the shape of the answer rather than the request.
+`structured_output: auto` asks for a JSON-Schema response format, drops to
+JSON mode when the provider rejects that, and drops once more to carrying the
+schema in the prompt and parsing the reply leniently; OpenRouter's DeepInfra
+turbo endpoints land on that last path. Each downgrade is remembered for the
+rest of the run, so it costs one request rather than one per batch. Naming the
+path outright with `structured_output: schema`, `json` or `text` skips the
+discovery for an endpoint whose answer you already know.
 
 ## Other OpenAI-compatible gateways (vLLM, LiteLLM)
 

@@ -26,7 +26,9 @@ type ContentFetcher func(ctx context.Context, path string) ([]byte, error)
 
 // Entry is one file prepared for review.
 type Entry struct {
-	File *diff.File
+	// SourceOnly marks unchanged source supplied as design evidence.
+	SourceOnly bool
+	File       *diff.File
 
 	// Content is the new-side file, empty when it was unavailable, binary, or
 	// excluded by the token budget.
@@ -47,6 +49,12 @@ type Entry struct {
 	// because a changed line uses them. See related.go.
 	Related []Related
 
+	// RelatedPreamble replaces the sentence Render writes above the Related
+	// definitions. Empty keeps the shipped sentence. Set from
+	// review.related_context_preamble, so a run can tune how the model treats
+	// attached context without editing the prompt.
+	RelatedPreamble string
+
 	// Tokens is the estimated cost of rendering this entry.
 	Tokens int
 }
@@ -56,7 +64,11 @@ func (e *Entry) HasContent() bool { return e.Content != "" }
 
 // Batch is a group of entries reviewed in one model call.
 type Batch struct {
-	Entries []Entry
+	// DesignTask identifies the complete package assessment carried by this call.
+	DesignTask string
+	// Assessment describes the task and its source scope.
+	Assessment string
+	Entries    []Entry
 
 	// Tokens is the estimated total for the batch.
 	Tokens int
@@ -74,6 +86,15 @@ func (b *Batch) Paths() []string {
 // Plan is the outcome of assembling a review.
 type Plan struct {
 	Batches []Batch
+
+	// BudgetPerBatch is the token budget a batch's entries were fitted to,
+	// after FramingReserved was taken out of review.token_budget_per_request.
+	BudgetPerBatch int
+
+	// FramingReserved is what was held back for the system prompt, the pull
+	// request context and the response schema. Disclosed because an operator
+	// who set a budget and sees smaller batches is owed the reason.
+	FramingReserved int
 
 	// Skipped records files that were excluded and why. Reporting these
 	// matters: a review that silently ignored half the diff looks identical
@@ -140,7 +161,7 @@ const (
 	ReasonIgnored     = "matched an ignore pattern"
 	ReasonBinary      = "binary file"
 	ReasonDeleted     = "file was deleted"
-	ReasonNoChanges   = "no added lines to comment on"
+	ReasonNoChanges   = "no surviving change anchors to comment on"
 	ReasonGenerated   = "generated file"
 	ReasonFileLimit   = "exceeded review.max_files"
 	ReasonUnavailable = "contents could not be read"
@@ -171,11 +192,33 @@ func Assemble(ctx context.Context, cfg *config.Config, files diff.Files, fetch C
 	return AssembleWith(ctx, cfg, files, fetch, nil)
 }
 
+// Reserve holds back what a batch's budget must leave for everything the
+// engine sends alongside the entries: the system prompt, the pull request
+// context, and the response schema.
+//
+// It exists because the budget bounded the entries and nothing else, so a
+// request estimated at 24,852 tokens against a 32,000 budget reached the
+// provider at 32,653. Measured in issue #81.
+type Reserve struct {
+	// Tokens is the framing the caller will send. Zero reserves nothing, which
+	// is the old behaviour and what a caller that cannot measure its own
+	// framing gets.
+	Tokens int
+}
+
 // AssembleWith is Assemble with a directory lister, which related context
 // needs to find the file a Go package or Python module defines a name in.
 // A nil lister attaches related context for the languages that can be
 // resolved without one and none for Go.
+//
+// It reserves nothing, for a caller that does not build the prompt and cannot
+// measure its framing.
 func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fetch ContentFetcher, list DirLister) (*Plan, error) {
+	return AssembleReserving(ctx, cfg, files, fetch, list, Reserve{})
+}
+
+// AssembleReserving plans a review, leaving room for the caller's framing.
+func AssembleReserving(ctx context.Context, cfg *config.Config, files diff.Files, fetch ContentFetcher, list DirLister, reserve Reserve) (*Plan, error) {
 	if cfg == nil {
 		return nil, errors.New("bundle: nil config")
 	}
@@ -183,11 +226,25 @@ func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fet
 	plan := &Plan{}
 	estimator := llms.DefaultTokenEstimator()
 
+	// The budget available to entries, after the framing that travels with
+	// them. Computed here rather than at packing, because a single file is
+	// fitted against it too: reserving only at packing let one entry fill the
+	// whole budget and then be sent with the system prompt on top, which is
+	// the one-batch case issue #81 measured.
+	//
+	// Floored rather than allowed to reach zero. A reserve larger than the
+	// budget is a misconfiguration, and answering it by reviewing nothing
+	// would turn a bad number into no review at all.
+	perBatch := max(1, cfg.Review.TokenBudgetPerRequest-reserve.Tokens)
+	plan.BudgetPerBatch = perBatch
+	plan.FramingReserved = reserve.Tokens
+
 	var related *relatedCollector
 	if cfg.Review.RelatedContext && fetch != nil {
 		related = newRelatedCollector(ctx, files, fetch, list)
 		related.maxBytes = cfg.Review.MaxFileBytes
 		related.callers = cfg.Review.RelatedContextCallers
+		related.rerank = cfg.Review.RelatedContextRerank
 	}
 
 	// Selection and content run in one pass so that review.max_files counts
@@ -213,8 +270,9 @@ func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fet
 		}
 
 		entry := Entry{
-			File:         f,
-			Instructions: cfg.InstructionsFor(f.Path),
+			File:            f,
+			Instructions:    cfg.InstructionsFor(f.Path),
+			RelatedPreamble: cfg.Review.RelatedContextPreamble,
 		}
 
 		if cfg.Review.IncludeFullFiles && fetch != nil {
@@ -245,7 +303,7 @@ func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fet
 		// answer is a narrower window rather than no content: the byte cap
 		// bounds what is held, the token budget bounds what is sent, and
 		// neither is allowed to decide what is understood on its own.
-		if reason := fitEntry(&entry, cfg.Review.TokenBudgetPerRequest, cfg.Review.MaxFileBytes, estimator); reason != "" {
+		if reason := fitEntry(&entry, perBatch, cfg.Review.MaxFileBytes, estimator); reason != "" {
 			if entry.Truncated {
 				plan.Windowed = append(plan.Windowed, Skip{Path: f.Path, Reason: reason})
 			} else {
@@ -256,7 +314,7 @@ func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fet
 		// After fitEntry, so the file's own window is decided first and the related
 		// context takes only what the request has left, never the other way round.
 		if related != nil {
-			budget := min(cfg.Review.RelatedContextTokens, cfg.Review.TokenBudgetPerRequest-entry.Tokens)
+			budget := min(cfg.Review.RelatedContextTokens, perBatch-entry.Tokens)
 			entry.Tokens += related.collect(&entry, budget, estimator)
 			for _, r := range entry.Related {
 				plan.RelatedDefinitions++
@@ -269,7 +327,7 @@ func AssembleWith(ctx context.Context, cfg *config.Config, files diff.Files, fet
 		entries = append(entries, entry)
 	}
 
-	plan.Batches = batch(entries, cfg.Review.MaxFilesPerRequest, cfg.Review.TokenBudgetPerRequest)
+	plan.Batches = batch(entries, cfg.Review.MaxFilesPerRequest, perBatch)
 	return plan, nil
 }
 
@@ -309,7 +367,7 @@ func skipReason(cfg *config.Config, f *diff.File) (string, bool) {
 		// There is nothing to comment on, and complaining about deleted code
 		// is the kind of noise that gets a bot switched off.
 		return ReasonDeleted, true
-	case len(f.ChangedLines()) == 0:
+	case len(f.CommentableLines()) == 0:
 		return ReasonNoChanges, true
 	}
 	return "", false
@@ -458,7 +516,7 @@ func fitEntry(e *Entry, budget, maxBytes int, estimator *llms.TokenEstimator) st
 //
 // Which of the two limits binds is decided entirely by file size, because
 // fitEntry has already sized every entry against the whole request budget on
-// its own. Measured by TestPackingTable at the shipped 60k budget and 6 files
+// its own. Measured by TestPackingTableReportsBudgetUse at the shipped 60k budget and 6 files
 // per request, by the row names it prints: "6 tiny" (20-line files) fills a
 // request to 4.9% of budget and "6 small (200L)" to 36.1%, both split only by
 // the file ceiling, while "6 big (2000L)" costs 33,116 tokens a file and takes
@@ -514,6 +572,15 @@ func RenderDiffOnly(e Entry) string {
 // lives in. Line numbers are included throughout, since a finding is only
 // actionable if the model can cite where it belongs.
 func Render(e Entry) string {
+	if e.SourceOnly {
+		var b strings.Builder
+		fmt.Fprintf(&b, "### Supporting source: %s\nFindings here are summary evidence, not inline comments.\n", promptSafe(e.File.Path))
+		for _, instruction := range e.Instructions {
+			fmt.Fprintf(&b, "Path instruction: %s\n", promptSafe(instruction))
+		}
+		fmt.Fprintf(&b, "\n```\n%s```\n", numberLines(e.Content))
+		return b.String()
+	}
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "### File: %s\n", promptSafe(e.File.Path))
@@ -536,7 +603,20 @@ func Render(e Entry) string {
 	b.WriteString(e.File.String())
 	b.WriteString("```\n")
 
-	if e.HasContent() {
+	// A file the change adds is already whole in its own diff: every line is
+	// an addition, and the diff renders each with its new-file line number, so
+	// the full-file section that follows would be the same content a second
+	// time in a different costume. It was 43,569 of 100,070 prompt characters
+	// on the three-file fixture in #81.
+	//
+	// Content itself is kept rather than dropped at assembly, because related
+	// context parses it for the imports a new file brings in, which is where
+	// that context is worth most.
+	//
+	// Only when the whole file is there. A window is a window even of an
+	// addition, and saying so is the point of the heading it carries.
+	wholeAddition := e.File != nil && e.File.Kind == diff.ChangeAdded && !e.Truncated
+	if e.HasContent() && !wholeAddition {
 		if e.Truncated {
 			// The width is stated because it tells the model how much of the
 			// file it is not seeing. Without it, a window reads like a whole
@@ -578,7 +658,12 @@ func Render(e Entry) string {
 		}
 		if len(defs) > 0 {
 			b.WriteString("\n#### Definitions this change uses, from files it does not touch\n\n")
-			b.WriteString("Context only. These files are not under review: judge the change by them, but do not report findings on them.\n\n")
+			preamble := e.RelatedPreamble
+			if preamble == "" {
+				preamble = "Context only. These files are not under review: judge the change by them, but do not report findings on them."
+			}
+			b.WriteString(preamble)
+			b.WriteString("\n\n")
 			for _, r := range defs {
 				b.WriteString(renderRelated(r))
 			}
@@ -613,4 +698,18 @@ func numberLines(content string) string {
 		fmt.Fprintf(&b, "%6d  %s\n", i+1, line)
 	}
 	return b.String()
+}
+
+// RenderBatch renders the source and task metadata sent together in one call.
+func RenderBatch(b Batch) string {
+	var out strings.Builder
+	if b.Assessment != "" {
+		out.WriteString(promptSafe(b.Assessment))
+		out.WriteString("\n\n")
+	}
+	for _, entry := range b.Entries {
+		out.WriteString(Render(entry))
+		out.WriteByte('\n')
+	}
+	return out.String()
 }

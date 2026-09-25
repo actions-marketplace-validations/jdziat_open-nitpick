@@ -62,6 +62,7 @@ var DefaultLinters = []string{"golangci-lint", "ruff"}
 // unset: naming a model is the one thing a user must decide.
 func Defaults() *Config {
 	return &Config{
+		Practices: DefaultPractices(),
 		Models: Models{
 			Default: ModelSpec{
 				StructuredOutput: StructuredAuto,
@@ -139,6 +140,11 @@ func Defaults() *Config {
 			// want semgrep, or a line in someone's .golangci.yml, deciding its
 			// gate says so.
 			MaxSeverity: SeverityCritical,
+		},
+		Security: Security{
+			// Warning, not none: a security scan that never fails is theater.
+			FailOn: SeverityWarning,
+			Model:  ptr(true),
 		},
 	}
 }

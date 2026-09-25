@@ -28,7 +28,8 @@ import (
 // remember. The invariant does not grow with the schema.
 type PolicyResolver interface {
 	// ResolvePolicy reports whether the change under review modifies the
-	// configuration's own source, and returns the policy to apply when it does.
+	// configuration's own source. A nonnil configuration selects the policy to
+	// apply, including operator scope adjustments when modified is false.
 	//
 	// changed carries every path in the change, taken from the parsed diff
 	// before any policy has narrowed it. Deciding this against an
@@ -91,6 +92,12 @@ func (e *Engine) resolvePolicy(ctx context.Context, ref vcs.Ref, pr *vcs.PullReq
 	current := Policy{Config: e.Config}
 
 	if e.Policy == nil {
+		// Said out loud. An engine reviewing a pull request without a resolver
+		// runs under whatever configuration it was handed, and this branch was
+		// silent, so the one command that had forgotten ran that way with
+		// nothing anywhere recording it. Two callers reach here on purpose, a
+		// tree review and the eval harness, and neither reviews a pull request.
+		e.log().Debug("no policy resolver; reviewing under the configuration this engine was given")
 		return current, nil
 	}
 
@@ -110,6 +117,9 @@ func (e *Engine) resolvePolicy(ctx context.Context, ref vcs.Ref, pr *vcs.PullReq
 		return Policy{}, fmt.Errorf("resolve review policy: %w", err)
 	}
 	if !modified {
+		if resolved != nil {
+			current.Config = resolved
+		}
 		return current, nil
 	}
 	if resolved == nil {

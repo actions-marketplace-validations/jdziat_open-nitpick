@@ -45,7 +45,7 @@ type Respond struct {
 
 	// MaxPerPullRequest caps how many comments the reviewer answers on one
 	// pull request, counting its own replies as the record of how many it has
-	// answered. Zero, the default, is no cap.
+	// answered, and zero, the default, is no cap at all.
 	//
 	// It bounds the case the association list does not: a collaborator, or an
 	// automation acting as one, in a loop.
@@ -129,12 +129,12 @@ func (r Respond) Allows(assoc string) bool {
 	}
 
 	for _, want := range r.EffectiveFrom() {
-		if want == got {
+		if Association(strings.ToLower(strings.TrimSpace(string(want)))) == got {
 			return true
 		}
 		// "none" is the forge's word for a stranger, so allowing it is the
 		// operator saying anyone may.
-		if want == AssocNone {
+		if Association(strings.ToLower(strings.TrimSpace(string(want)))) == AssocNone {
 			return true
 		}
 	}

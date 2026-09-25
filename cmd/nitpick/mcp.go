@@ -16,6 +16,7 @@ import (
 
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/fullreview"
+	"github.com/jdziat/open-nitpick/internal/practices"
 	"github.com/jdziat/open-nitpick/internal/review"
 	"github.com/jdziat/open-nitpick/internal/vcs"
 )
@@ -48,7 +49,7 @@ func runMCP(ctx context.Context, args []string) error {
 	fs.StringVar(&repo, "repo", ".", "default repository root for tools that do not name one")
 	fs.BoolVar(&verbose, "v", false, "verbose logging on stderr")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: nitpick mcp [flags]\n       nitpick mcp install <client> [-user] [-print]\n       nitpick mcp clients\n\nServes the review tools over the Model Context Protocol on stdio, for an agent session.\nTools: review, full_review, repo_score, code_smell, ai_slop, explain_config.\ninstall writes the server into a client's configuration (claude-code, claude-desktop, cursor, windsurf, vscode, opencode, gemini-cli, codex).\n\nFlags:")
+		fmt.Fprintln(os.Stderr, "Usage: nitpick mcp [flags]\n       nitpick mcp install <client> [-user] [-print]\n       nitpick mcp clients\n\nServes the review tools over the Model Context Protocol on stdio, for an agent session.\nTools: review, full_review, repo_score, code_smell, ai_slop, security_scan, explain_config.\ninstall writes the server into a client's configuration (claude-code, claude-desktop, cursor, windsurf, vscode, opencode, gemini-cli, codex).\n\nFlags:")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -101,6 +102,14 @@ func newMCPServer(root string, log *slog.Logger) *mcp.Server {
 			"Returns tells by rule, the model's findings with suggestions, both per thousand lines, findings outside the slop class the review made (hidden), and recommendations ordered by count. Pass paths to keep the model's pass cheap; no_model is free.",
 	}, t.aiSlop)
 	mcp.AddTool(server, &mcp.Tool{
+		Name: "security_scan",
+		Description: "Security scan of the paths given (or the whole tree). Required deterministic scanners always run (osv-scanner, gitleaks, and catalog-applicable tools such as golangci-lint with gosec, zizmor, checkov, brakeman); " +
+			"an optional model pass is filtered to class security (non-security findings are hidden, not dropped). " +
+			"complete=true means required instruments finished — not that every language had a SAST (Python/JS need Semgrep configured). " +
+			"Absolute repo paths are trusted-operator-only. There is no no_linters and no budget. fail_on none requires allow_clean_with_no_gate. " +
+			"Returns findings, scanner roster, model status, complete/failed_stages, and whether the security gate failed.",
+	}, t.securityScan)
+	mcp.AddTool(server, &mcp.Tool{
 		Name:        "explain_config",
 		Description: "The resolved open-nitpick configuration for a repository: config source, models per role, validation, gating, budget, analyzers, persona, and the instructions that apply to a given path.",
 	}, t.explainConfig)
@@ -134,19 +143,29 @@ type Withheld struct {
 	Title  string `json:"title"`
 	Expert string `json:"expert"`
 	Reason string `json:"reason"`
+
+	// Cited is the knowledge entry the expert said decided its verdict, empty
+	// when it named none or named one it was not shown.
+	Cited string `json:"cited,omitempty"`
 }
 
 // ReviewOut is what review returns.
 type ReviewOut struct {
-	Summary   string         `json:"summary" jsonschema:"the walkthrough the triage model wrote"`
-	Findings  []Finding      `json:"findings"`
-	Counts    map[string]int `json:"counts" jsonschema:"findings by severity"`
-	Files     int            `json:"files" jsonschema:"files reviewed"`
-	Analyzers []Analyzer     `json:"analyzers,omitempty"`
-	Withheld  []Withheld     `json:"withheld,omitempty"`
-	Policy    string         `json:"policy,omitempty" jsonschema:"set when the change's own configuration was set aside, and why"`
-	FailOn    string         `json:"fail_on" jsonschema:"the configured gate"`
-	Failed    bool           `json:"failed" jsonschema:"whether a finding reached the gate"`
+	Practices *practices.Report `json:"practices,omitempty" jsonschema:"engineering check coverage and policy findings when selected"`
+	Summary   string            `json:"summary" jsonschema:"the walkthrough the triage model wrote"`
+	Findings  []Finding         `json:"findings"`
+	Counts    map[string]int    `json:"counts" jsonschema:"findings by severity"`
+	Files     int               `json:"files" jsonschema:"files reviewed"`
+	Analyzers []Analyzer        `json:"analyzers,omitempty"`
+	Withheld  []Withheld        `json:"withheld,omitempty"`
+	Policy    string            `json:"policy,omitempty" jsonschema:"set when the change's own configuration was set aside, and why"`
+	FailOn    string            `json:"fail_on" jsonschema:"the selected gate: a severity threshold or engineering policy"`
+	Failed    bool              `json:"failed" jsonschema:"whether the selected policy failed, including required incomplete engineering checks"`
+	// An agent reading this over a socket has no exit code and no log, so the
+	// tree tools' Unreviewed has a counterpart here. Without it a review whose
+	// triage died is indistinguishable from one that had nothing to say.
+	Complete     bool     `json:"complete" jsonschema:"whether every planned file was reviewed and every required stage ran"`
+	FailedStages []string `json:"failed_stages,omitempty" jsonschema:"required stages that did not complete"`
 }
 
 // TreeOut is what the tree tools return: the review, the grouped
@@ -223,7 +242,11 @@ func (t *mcpTools) review(ctx context.Context, _ *mcp.CallToolRequest, in Review
 	}
 	provider := vcs.NewLocal(repo, io.Discard)
 	ref := vcs.Ref{Base: f.base, Head: f.head}
-	report, err := newEngine(f, repo, cfg, provider, t.log).Review(ctx, ref)
+	engine, err := newEngine(ctx, f, repo, cfg, provider, ref, t.log)
+	if err != nil {
+		return nil, ReviewOut{}, err
+	}
+	report, err := engine.Review(ctx, ref)
 	if err != nil && (!errors.Is(err, review.ErrPublish) || report == nil) {
 		return nil, ReviewOut{}, err
 	}
@@ -259,6 +282,26 @@ func (t *mcpTools) aiSlop(ctx context.Context, _ *mcp.CallToolRequest, in SlopIn
 	res, err := slopScore(ctx, f, in.Paths, in.Budget, in.NoModel, t.log)
 	if err != nil {
 		return nil, SlopResult{}, err
+	}
+	return textResult(strings.TrimSpace(res.Text())), *res, nil
+}
+
+// SecurityIn selects the tree for security_scan. Deliberately omits no_linters
+// and budget: the security surface rejects those theater knobs.
+type SecurityIn struct {
+	Repo                 string   `json:"repo,omitempty" jsonschema:"repository root; absolute paths are trusted-operator-only; the server's default when omitted"`
+	Paths                []string `json:"paths,omitempty" jsonschema:"paths under the repository root; the whole tree when omitted"`
+	Instruction          string   `json:"instruction,omitempty"`
+	NoModel              bool     `json:"no_model,omitempty" jsonschema:"deterministic scanners only: no model call"`
+	FailOn               string   `json:"fail_on,omitempty" jsonschema:"override security.fail_on: nit, info, warning, error, critical or none"`
+	AllowCleanWithNoGate bool     `json:"allow_clean_with_no_gate,omitempty" jsonschema:"loud waiver required before fail_on none may green a complete run"`
+}
+
+func (t *mcpTools) securityScan(ctx context.Context, _ *mcp.CallToolRequest, in SecurityIn) (*mcp.CallToolResult, SecurityResult, error) {
+	f := &reviewFlags{repo: t.repoFor(in.Repo), instruction: in.Instruction}
+	res, err := securityScan(ctx, f, in.Paths, in.NoModel, in.FailOn, in.AllowCleanWithNoGate, t.log)
+	if err != nil {
+		return nil, SecurityResult{}, err
 	}
 	return textResult(strings.TrimSpace(res.Text())), *res, nil
 }
@@ -316,6 +359,9 @@ func (t *mcpTools) tree(ctx context.Context, in TreeIn, score bool) (*mcp.CallTo
 		out.Sections = strings.TrimSpace(fullreview.Sections(&filtered))
 		out.Plan = strings.TrimSpace(fullreview.RemediationPlan(filtered.Findings))
 		out.Failed = filtered.Failed(failOn)
+		if report.Practices != nil {
+			out.Summary += "\n\nThe class filter changes displayed findings; the engineering policy gate still evaluates every required practice."
+		}
 		out.Summary = strings.TrimSpace(out.Summary) + fmt.Sprintf("\n\nFiltered to %s: %d of %d finding(s) shown.", strings.Join(in.Classes, ", "), len(kept), total)
 	}
 	text := reviewText(out.ReviewOut) + "\n\n" + out.Sections + "\n\n" + out.Plan + "\n" + strings.TrimSpace(fullreview.CoverageNotice(report, tree))
@@ -341,7 +387,18 @@ func (t *mcpTools) explainConfig(_ context.Context, _ *mcp.CallToolRequest, in E
 
 // reviewOut converts a report.
 func reviewOut(report *review.Report, failOn config.Severity) ReviewOut {
-	out := ReviewOut{Summary: report.Summary, Files: report.Plan.Files(), FailOn: string(failOn), Failed: report.Failed(failOn)}
+	out := ReviewOut{
+		Summary:      report.Summary,
+		Practices:    report.Practices,
+		Files:        report.Plan.Files(),
+		FailOn:       string(failOn),
+		Failed:       report.Failed(failOn),
+		Complete:     report.PipelineComplete(),
+		FailedStages: report.FailedStages(),
+	}
+	if report.Practices != nil {
+		out.FailOn = "engineering"
+	}
 	for _, f := range report.Findings {
 		out.Findings = append(out.Findings, Finding{
 			Path: f.Path, Line: f.Line, Severity: f.Severity, Class: f.Class, Category: f.Category,
@@ -353,7 +410,8 @@ func reviewOut(report *review.Report, failOn config.Severity) ReviewOut {
 		out.Analyzers = append(out.Analyzers, Analyzer{Name: s.Linter, Outcome: string(s.Outcome), State: s.State})
 	}
 	for _, o := range report.Overruled {
-		out.Withheld = append(out.Withheld, Withheld{Path: o.Finding.Path, Line: o.Finding.Line, Title: o.Finding.Title, Expert: o.Expert, Reason: o.Reason})
+		out.Withheld = append(out.Withheld, Withheld{Path: o.Finding.Path, Line: o.Finding.Line,
+			Title: o.Finding.Title, Expert: o.Expert, Reason: o.Reason, Cited: o.Cited})
 	}
 	if report.Policy.Replaced {
 		out.Policy = fmt.Sprintf("the change edits %s, so it was reviewed under %s", report.Policy.Modified, report.Policy.Source())
@@ -381,6 +439,9 @@ func reviewText(out ReviewOut) string {
 	var b strings.Builder
 	if out.Summary != "" {
 		b.WriteString(strings.TrimSpace(out.Summary) + "\n\n")
+	}
+	if out.Practices != nil {
+		b.WriteString(out.Practices.Text() + "\n")
 	}
 	fmt.Fprintf(&b, "%d file(s) reviewed, %d finding(s)", out.Files, len(out.Findings))
 	if len(out.Counts) > 0 {
@@ -423,7 +484,17 @@ func reviewText(out ReviewOut) string {
 	if len(out.Withheld) > 0 {
 		fmt.Fprintf(&b, "\n%d finding(s) withheld:", len(out.Withheld))
 		for _, w := range out.Withheld {
-			fmt.Fprintf(&b, "\n  %s:%d %s (%s: %s)", w.Path, w.Line, w.Title, w.Expert, w.Reason)
+			// The citation belongs on both halves of the result. A client
+			// reading the text sees the reason a finding was removed, and the
+			// entry that reason rests on is part of it.
+			// After the reason, as printOverruled renders it. Between the
+			// expert and the reason the id and the sentence run together and a
+			// reader cannot see where the id ends.
+			cited := ""
+			if w.Cited != "" {
+				cited = fmt.Sprintf(" (citing %s)", w.Cited)
+			}
+			fmt.Fprintf(&b, "\n  %s:%d %s (%s: %s)%s", w.Path, w.Line, w.Title, w.Expert, w.Reason, cited)
 		}
 		b.WriteString("\n")
 	}

@@ -79,10 +79,13 @@ func (s Score) Findings() []review.Finding {
 
 // ScoreRun evaluates one run against its fixture.
 func ScoreRun(r RunResult, f Fixture) Score {
+	plants := PersonaDefects(f)
+	scoped := f
+	scoped.Defects = plants
 	s := Score{
 		RunResult: r,
 		Detected:  map[string]bool{},
-		Total:     len(f.Defects),
+		Total:     len(plants),
 		Severity:  SeverityScore{Planted: PlantedLevels{}},
 	}
 
@@ -99,8 +102,10 @@ func ScoreRun(r RunResult, f Fixture) Score {
 	// ScoreSeverity takes the same census again on the path that reaches it, and
 	// the duplication is deliberate: it is exported and its own contract is that
 	// a score carries its denominators, so neither caller may rely on the other
-	// having done it.
-	s.Severity.Planted.Add(f)
+	// having done it. Under NITPICK_EVAL_SECURITY the census follows
+	// PersonaDefects so a security run is not graded on classes it was told
+	// not to report.
+	s.Severity.Planted.Add(scoped)
 
 	if r.Err != nil {
 		s.Violations = append(s.Violations, fmt.Sprintf("review failed: %v", r.Err))
@@ -119,21 +124,21 @@ func ScoreRun(r RunResult, f Fixture) Score {
 				len(r.Report.Incomplete), strings.Join(r.Report.Incomplete, ", ")))
 	}
 
-	// Every DETECTION READING COMES FROM ScoreDetection, including the located
-	// set this function used to compute for itself. Two reasons, and the second
-	// is the one that matters: the judged batteries hold a finding list and never
-	// build a RunResult for the incumbent, so they must read these off the same
-	// code; and "which defects were located" was written out twice, here and
-	// inside the anchor arithmetic, which is two expressions for one integer and
-	// free to drift under an edit to either.
-	det := ScoreDetection(f, r.Report.Findings)
+	// Every DETECTION READING COMES FROM ScoreDetectionForEval, including the
+	// located set this function used to compute for itself. Two reasons, and
+	// the second is the one that matters: the judged batteries hold a finding
+	// list and never build a RunResult for the incumbent, so they must read
+	// these off the same code; and "which defects were located" was written
+	// out twice, here and inside the anchor arithmetic, which is two
+	// expressions for one integer and free to drift under an edit to either.
+	det := ScoreDetectionForEval(f, r.Report.Findings)
 	s.WidestAnchor = det.WidestAnchor
 	s.Unmatched = det.Unmatched
 	s.Detected = det.Detected
 	s.Matched = det.Matched
 	s.AnchoredLines = det.AnchoredLines
 
-	s.Severity = ScoreSeverity(f, r.Report.Findings)
+	s.Severity = ScoreSeverityForEval(f, r.Report.Findings)
 
 	s.Violations = append(s.Violations, checkInvariants(r)...)
 
@@ -211,20 +216,93 @@ func (d DetectionScore) Noise() int { return len(d.Unmatched) }
 // the cached incumbent's side of the head-to-head and re-runnable offline over a
 // retained dump: no run index, no usage record and no judge verdict is consulted.
 func ScoreDetection(f Fixture, findings []review.Finding) DetectionScore {
+	return scoreDetectionAgainst(f.Defects, findings, nil)
+}
+
+// ScoreDetectionForEval scores detection under the active eval persona.
+//
+// When NITPICK_EVAL_SECURITY is on, only ClassSecurity plants are in the
+// denominator. Findings that match a non-security plant on the same fixture
+// are out of scope (neither a credit nor noise) so multi-defect stays honest.
+// Mutation: always call ScoreDetection and multi-defect caps a perfect
+// security review at 1/3.
+func ScoreDetectionForEval(f Fixture, findings []review.Finding) DetectionScore {
+	return ScoreDetectionForPersona(f, findings, securityPersonaActive())
+}
+
+// ScoreDetectionForPersona scores detection for an explicit security persona
+// flag. Dump replay must pass the recorded SecurityPersona rather than reading
+// the caller's environment.
+func ScoreDetectionForPersona(f Fixture, findings []review.Finding, security bool) DetectionScore {
+	if !security {
+		return ScoreDetection(f, findings)
+	}
+	return scoreDetectionAgainst(securityClassDefects(f.Defects), findings, outOfScopeDefects(f.Defects))
+}
+
+// ScoreSeverityForEval grades severity under the active eval persona, using
+// the same plant set as ScoreDetectionForEval.
+func ScoreSeverityForEval(f Fixture, findings []review.Finding) SeverityScore {
+	return ScoreSeverityForPersona(f, findings, securityPersonaActive())
+}
+
+// ScoreSeverityForPersona grades severity for an explicit security persona flag.
+func ScoreSeverityForPersona(f Fixture, findings []review.Finding, security bool) SeverityScore {
+	if !security {
+		return ScoreSeverity(f, findings)
+	}
+	scoped := f
+	scoped.Defects = securityClassDefects(f.Defects)
+	return ScoreSeverity(scoped, findings)
+}
+
+// PersonaDefects is the plant set the active eval persona is scored on.
+func PersonaDefects(f Fixture) []Defect {
+	return PersonaDefectsFor(f, securityPersonaActive())
+}
+
+// PersonaDefectsFor returns the plant set for an explicit security persona flag.
+func PersonaDefectsFor(f Fixture, security bool) []Defect {
+	if !security {
+		return f.Defects
+	}
+	return securityClassDefects(f.Defects)
+}
+
+func securityPersonaActive() bool {
+	return securityPersonaInstruction() != ""
+}
+
+func securityClassDefects(defects []Defect) []Defect {
+	out := make([]Defect, 0, len(defects))
+	for _, d := range defects {
+		if d.Class == config.ClassSecurity {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func outOfScopeDefects(defects []Defect) []Defect {
+	out := make([]Defect, 0, len(defects))
+	for _, d := range defects {
+		if d.Class != config.ClassSecurity {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func scoreDetectionAgainst(defects []Defect, findings []review.Finding, outOfScope []Defect) DetectionScore {
 	out := DetectionScore{Detected: map[string]bool{}}
 
 	for _, finding := range findings {
 		out.WidestAnchor = max(out.WidestAnchor, anchoredLines(finding))
 	}
 
-	// Per FINDING is not enough on its own: it cannot tell one comment claiming
-	// seventeen regions from seventeen comments claiming one line each about the
-	// same defect, and for a reader those are the same seventeen lines. Both are
-	// taken because neither subsumes the other, a wide finding on a fixture that
-	// plants nothing belongs to no defect and would vanish from the second.
-	claimed := defectAnchoredLines(findings, f.Defects)
+	claimed := defectAnchoredLines(findings, defects)
 
-	for i, d := range f.Defects {
+	for i, d := range defects {
 		out.WidestAnchor = max(out.WidestAnchor, claimed[i])
 
 		found := false
@@ -235,8 +313,6 @@ func ScoreDetection(f Fixture, findings []review.Finding) DetectionScore {
 			}
 		}
 
-		// OR rather than assignment: two defects may share a Why, and one of them
-		// being located is what the map is asked about.
 		out.Detected[d.Why] = out.Detected[d.Why] || found
 		if !found {
 			continue
@@ -245,11 +321,13 @@ func ScoreDetection(f Fixture, findings []review.Finding) DetectionScore {
 		out.AnchoredLines += claimed[i]
 	}
 
-	// Anything not explaining a planted defect is noise on this corpus.
 	for _, finding := range findings {
-		if !explainsAny(finding, f.Defects) {
+		if len(outOfScope) > 0 && explainsAny(finding, outOfScope) {
+			continue
+		}
+		if !explainsAny(finding, defects) {
 			out.Unmatched = append(out.Unmatched, finding)
-			if nearMiss(finding, f.Defects) {
+			if nearMiss(finding, defects) {
 				out.NearMisses++
 			}
 		}
@@ -286,7 +364,7 @@ const (
 // NoCrossToolSeverityScore is printed wherever a reader might go looking for a
 // cross-tool severity accuracy figure.
 //
-// The note behind it is in docs/measurement.md#nocrosstoolseverityscore.
+// The note behind it is in docs/harness-notes.md#nocrosstoolseverityscore.
 const NoCrossToolSeverityScore = "NO CROSS-TOOL SEVERITY ACCURACY IS OFFERED, BY CONSTRUCTION. " +
 	"Our five levels and " + IncumbentModel + "'s ~three are different RESOLUTIONS, and every " +
 	"reduction that makes them comparable is maximised by a reviewer that also picks what to mention: " +
@@ -306,7 +384,7 @@ const NoCrossToolSeverityScore = "NO CROSS-TOOL SEVERITY ACCURACY IS OFFERED, BY
 // SeverityScale is DECLARED by whatever adapter produced a row's findings, and
 // it is not derivable from them.
 //
-// The note behind it is in docs/measurement.md#severityscale.
+// The note behind it is in docs/harness-notes.md#severityscale.
 type SeverityScale string
 
 const (
@@ -366,7 +444,7 @@ type SeverityWord struct {
 // SeverityUsage tabulates which severity words a reviewer printed for
 // the defects it located, against the level each defect was planted at.
 //
-// The note behind it is in docs/measurement.md#severityusage.
+// The note behind it is in docs/harness-notes.md#severityusage.
 type SeverityUsage map[config.Severity]map[SeverityWord]int
 
 // Add records one graded defect.
@@ -383,7 +461,7 @@ func (u SeverityUsage) Add(planted config.Severity, said SeverityWord) {
 // level, the DENOMINATOR of the contingency table, and the half of it that has
 // nothing to do with what the reviewer said.
 //
-// The note behind it is in docs/measurement.md#plantedlevels.
+// The note behind it is in docs/harness-notes.md#plantedlevels.
 type PlantedLevels map[config.Severity]int
 
 // Add counts one fixture's plants.
@@ -630,7 +708,7 @@ type SeverityCall struct {
 
 // SeverityScore compares assigned severities against the planted ones.
 //
-// The note behind it is in docs/measurement.md#severityscore.
+// The note behind it is in docs/harness-notes.md#severityscore.
 type SeverityScore struct {
 	Accurate    int
 	Inflated    int
@@ -670,7 +748,7 @@ func (s SeverityScore) Usage() SeverityUsage {
 // this
 // package recorded it at.
 //
-// The note behind it is in docs/measurement.md#severityassaid.
+// The note behind it is in docs/harness-notes.md#severityassaid.
 func severityAsSaid(f review.Finding) SeverityWord {
 	w := SeverityWord{Said: f.RawSeverity, Recorded: f.Sev()}
 	if w.Said == "" && !severityWasTranslated(f) {
@@ -739,7 +817,7 @@ func ScoreSeverity(f Fixture, findings []review.Finding) SeverityScore {
 // severityVerdict compares an assigned severity against the planted one at our
 // full five-level resolution.
 //
-// The note behind it is in docs/measurement.md#severityverdict.
+// The note behind it is in docs/harness-notes.md#severityverdict.
 func severityVerdict(got, want config.Severity) string {
 	g, _ := got.Normalize()
 	w, _ := want.Normalize()
@@ -757,7 +835,7 @@ func severityVerdict(got, want config.Severity) string {
 // reportingFinding picks which of a review's findings is credited with
 // reporting a defect, returning its index.
 //
-// The note behind it is in docs/measurement.md#reportingfinding.
+// The note behind it is in docs/harness-notes.md#reportingfinding.
 func reportingFinding(findings []review.Finding, d Defect) (int, bool) {
 	var (
 		best  int
@@ -826,7 +904,7 @@ func matches(f review.Finding, d Defect) bool {
 // anchorDistance is how far a finding's anchor sits from a line, measured from
 // the NEAREST point of a multi-line anchor rather than its start.
 //
-// The note behind it is in docs/measurement.md#anchordistance.
+// The note behind it is in docs/harness-notes.md#anchordistance.
 func anchorDistance(f review.Finding, line int) int {
 	best := spanDistance(review.LineSpan{Line: f.Line, EndLine: f.EndLine}, line)
 
@@ -863,7 +941,7 @@ func spanDistance(s review.LineSpan, line int) int {
 // region
 // in AlsoAt as one set. One for the ordinary single-line anchor.
 //
-// The note behind it is in docs/measurement.md#anchoredlines.
+// The note behind it is in docs/harness-notes.md#anchoredlines.
 func anchoredLines(f review.Finding) int {
 	claimed := map[int]bool{}
 	coverInto(claimed, f)
@@ -894,7 +972,7 @@ func coverInto(claimed map[int]bool, f review.Finding) {
 // It
 // returns one count per defect, in the order they are planted.
 //
-// The note behind it is in docs/measurement.md#defectanchoredlines.
+// The note behind it is in docs/harness-notes.md#defectanchoredlines.
 func defectAnchoredLines(findings []review.Finding, defects []Defect) []int {
 	out := make([]int, len(defects))
 
@@ -915,13 +993,13 @@ func defectAnchoredLines(findings []review.Finding, defects []Defect) []int {
 // noiseTolerance is how far from a planted defect a finding may sit and still
 // count as being ABOUT it rather than as invented.
 //
-// The note behind it is in docs/measurement.md#noisetolerance.
+// The note behind it is in docs/harness-notes.md#noisetolerance.
 const noiseTolerance = 6
 
 // explainsAny reports whether a finding describes any planted defect: it names
 // the defect and sits near it.
 //
-// The note behind it is in docs/measurement.md#explainsany.
+// The note behind it is in docs/harness-notes.md#explainsany.
 func explainsAny(f review.Finding, defects []Defect) bool {
 	for _, d := range defects {
 		if f.Path != d.Path || !mentionsAny(f, d.Keywords) {
@@ -1112,7 +1190,7 @@ func (s Summary) Spread() (float64, bool) {
 // Stable reports whether every run produced the same number of findings, and
 // whether that question has an answer for this row.
 //
-// The note behind it is in docs/measurement.md#stable.
+// The note behind it is in docs/harness-notes.md#stable.
 func (s Summary) Stable() (stable, defined bool) {
 	if len(s.FindingCounts) < 2 {
 		return true, false
@@ -1140,7 +1218,7 @@ func (s Summary) Recall() float64 {
 
 // RateLegend is printed under every table that carries a rate.
 //
-// The note behind it is in docs/measurement.md#ratelegend.
+// The note behind it is in docs/harness-notes.md#ratelegend.
 const RateLegend = "EVERY RATE HERE IS A QUOTIENT OF TWO SMALL INTEGERS, AND THE COUNTS ARE PRINTED " +
 	"BESIDE IT FOR THAT REASON. A rate measured over d observations moves only in steps of 1/d, so " +
 	"two rows differing by less than 1/d are not distinguishable by it — the decimals are arithmetic, " +
@@ -1218,7 +1296,7 @@ func CorpusResolution(fixtures []Fixture) string {
 
 // SeverityCell renders this row's SEV a/i/u cell.
 //
-// The note behind it is in docs/measurement.md#severitycell.
+// The note behind it is in docs/harness-notes.md#severitycell.
 func (s Summary) SeverityCell() string {
 	if !s.Scale.PublishesOurLevels() {
 		return "n/a"
@@ -1570,7 +1648,7 @@ func PublishedMetrics() []PublishedMetric {
 // THE
 // DESCRIPTION A CALIBRATED ONE PRODUCES?
 //
-// The note behind it is in docs/measurement.md#publisheddescription.
+// The note behind it is in docs/harness-notes.md#publisheddescription.
 type PublishedDescription struct {
 	// Name is how the artifact is referred to in a failure message and in the
 	// degenerate table's declarations.
@@ -1612,7 +1690,7 @@ func PublishedDescriptions() []PublishedDescription {
 // SeverityCells maps every published column that states a severity reading in
 // OUR five levels to the function that renders it.
 //
-// The note behind it is in docs/measurement.md#severitycells.
+// The note behind it is in docs/harness-notes.md#severitycells.
 func SeverityCells() map[string]func(t CorpusTally) string {
 	objective := func(pick int) func(CorpusTally) string {
 		return func(t CorpusTally) string {
@@ -1689,7 +1767,7 @@ const (
 // by
 // declaration.
 //
-// The note behind it is in docs/measurement.md#registeredtableheaders.
+// The note behind it is in docs/harness-notes.md#registeredtableheaders.
 var registeredTableHeaders []struct {
 	kind   tableKind
 	header string
@@ -1707,7 +1785,7 @@ func registerTableHeader(kind tableKind, header string) string {
 
 // The headers of every table the eval reports print.
 //
-// The note behind it is in docs/measurement.md#the-headers-of-every-table-the-eval-reports-print.
+// The note behind it is in docs/harness-notes.md#tablescored-headers.
 var (
 	// SummaryTableHeader is the ground-truth battery's table: no judge, no
 	// foreign reviewer, one row per model and fixture.
@@ -1730,10 +1808,9 @@ var (
 )
 
 // The cost and judge-swap tables, registered from here rather than beside
-// their
-// own declarations.
+// their own declarations.
 //
-// The note behind it is in docs/measurement.md#the-cost-and-judge-swap-tables-registered-from-here-rather.
+// The note behind it is in docs/harness-notes.md#tableunscored-headers.
 var (
 	_ = registerTableHeader(tableUnscored, CostTableHeader)
 	_ = registerTableHeader(tableUnscored, precisionHeader)
@@ -1788,7 +1865,7 @@ func JudgeOpinionColumns() []string {
 // it.
 // They are not scores: no reviewer is better for having a larger N.
 //
-// The note behind it is in docs/measurement.md#descriptivecolumns.
+// The note behind it is in docs/harness-notes.md#descriptivecolumns.
 func DescriptiveColumns() []string {
 	return []string{
 		"MODEL", "FIXTURE", "VARIANT", "RUNS", "N", "COV", "FAIL", "FAILED",

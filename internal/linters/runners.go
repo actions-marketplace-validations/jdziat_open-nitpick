@@ -22,6 +22,7 @@ import (
 
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/diff"
+	"github.com/jdziat/open-nitpick/internal/gomod"
 	"github.com/jdziat/open-nitpick/internal/review"
 )
 
@@ -225,13 +226,49 @@ func resolveConfig(path, repoRoot string) (string, error) {
 
 // golangciDefaults is the golangci-lint configuration open-nitpick owns.
 //
-// The note behind it is in docs/analyzers.md#golangcidefaults.
+// The note behind it is in docs/runner-notes.md#golangcidefaults.
 //
 //go:embed golangci.yml
 var golangciDefaults []byte
 
-// writeGolangciDefaults materializes the embedded config and returns its path
-// and a cleanup function.
+// golangciConventions is the ruleset a conformity measurement reads.
+//
+// Separate from the review's because the two ask different questions. See the
+// file's own header.
+//
+//go:embed golangci-conventions.yml
+var golangciConventions []byte
+
+// golangciSecurityDefaults is the ruleset `nitpick security` uses when the
+// operator supplied no golangci_config: standard plus gosec. Review keeps
+// golangciDefaults without gosec; enabling it there would post every gosec
+// finding on ordinary pull requests.
+//
+//go:embed golangci-security.yml
+var golangciSecurityDefaults []byte
+
+// writeGolangciDefaults materializes the review's ruleset outside the tree.
+func writeGolangciDefaults(repoRoot string) (string, func(), error) {
+	return writeGolangciConfig(repoRoot, golangciDefaults)
+}
+
+// WriteGolangciConventions materializes the conformity ruleset outside the
+// repository and returns its path and a cleanup function.
+//
+// Exported because the conformity measurement lives beside this package and has
+// to point the runner at a ruleset the review does not use.
+func WriteGolangciConventions(repoRoot string) (string, func(), error) {
+	return writeGolangciConfig(repoRoot, golangciConventions)
+}
+
+// writeGolangciSecurityDefaults materializes the security ruleset (gosec on)
+// outside the tree.
+func writeGolangciSecurityDefaults(repoRoot string) (string, func(), error) {
+	return writeGolangciConfig(repoRoot, golangciSecurityDefaults)
+}
+
+// writeGolangciConfig materializes one of our embedded rulesets and returns its
+// path and a cleanup function.
 //
 // The file must not be written inside the repository under review, that would
 // be this tool putting a config file into the tree and then reading policy out
@@ -245,7 +282,7 @@ var golangciDefaults []byte
 // It can be defeated by an operator whose TMPDIR points inside the checkout, and
 // that is precisely why the check is here rather than assumed: the answer is a
 // refusal with a reason, not a config written into the tree.
-func writeGolangciDefaults(repoRoot string) (string, func(), error) {
+func writeGolangciConfig(repoRoot string, body []byte) (string, func(), error) {
 	dir, err := os.MkdirTemp("", "open-nitpick-golangci-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create a directory for open-nitpick's analyzer config: %w", err)
@@ -253,7 +290,7 @@ func writeGolangciDefaults(repoRoot string) (string, func(), error) {
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
 	file := filepath.Join(dir, "golangci.yml")
-	if err := os.WriteFile(file, golangciDefaults, 0o600); err != nil {
+	if err := os.WriteFile(file, body, 0o600); err != nil {
 		cleanup()
 		return "", nil, fmt.Errorf("write open-nitpick's analyzer config: %w", err)
 	}
@@ -268,9 +305,19 @@ func writeGolangciDefaults(repoRoot string) (string, func(), error) {
 }
 
 // golangciLint runs golangci-lint over the changed Go packages.
-type golangciLint struct{ cfg analyzerConfig }
+type golangciLint struct {
+	cfg analyzerConfig
+
+	// ForceGosec enables gosec for this run: security defaults when the
+	// operator supplied no config, and `--enable=gosec` on every invocation so
+	// an operator config that disables it cannot greenwash the security roster.
+	ForceGosec bool
+}
 
 func (g *golangciLint) Name() string { return "golangci-lint" }
+
+// GosecForced reports whether this runner enables gosec for the security roster.
+func (g *golangciLint) GosecForced() bool { return g.ForceGosec }
 
 // Detect reports why golangci-lint will not run, and nil when it will.
 //
@@ -310,8 +357,20 @@ func (g *golangciLint) Detect(_ context.Context, repoRoot string, files []string
 // stock defaults, which is how a `// Code generated` line in the diff switches
 // the analyzer off for that file. A reader has to tell "nothing configured
 // this" from "open-nitpick configured this".
+//
+// When ForceGosec is set the string always contains "gosec:enabled" so the
+// security roster can prove the overlay was requested, whether the config came
+// from the security embed or an operator path.
 func (g *golangciLint) State() string {
-	return g.cfg.state("isolated: open-nitpick's own analyzer config")
+	isolated := "isolated: open-nitpick's own analyzer config"
+	if g.ForceGosec && g.cfg.Ref == "" && g.cfg.Err == nil {
+		isolated = "isolated: open-nitpick's security analyzer config"
+	}
+	state := g.cfg.state(isolated)
+	if g.ForceGosec {
+		return state + "; gosec:enabled"
+	}
+	return state
 }
 
 // golangciOutput is the part of golangci-lint's JSON report this package reads.
@@ -367,10 +426,15 @@ func (g *golangciLint) Run(ctx context.Context, repoRoot string, files []string)
 
 	// Ours when the operator supplied none. Not "no config": --no-config leaves
 	// golangci-lint's own defaults deciding what the tree can suppress, and
-	// exclusions.generated is one of them.
+	// exclusions.generated is one of them. ForceGosec swaps in the security
+	// embed so gosec is in the file as well as on the command line.
 	configRef := g.cfg.Ref
 	if configRef == "" {
-		file, cleanup, err := writeGolangciDefaults(repoRoot)
+		write := writeGolangciDefaults
+		if g.ForceGosec {
+			write = writeGolangciSecurityDefaults
+		}
+		file, cleanup, err := write(repoRoot)
 		if err != nil {
 			// A failure to CONFIGURE the analyzer is reported as the analyzer not
 			// running, never as a quieter run under whatever defaults were left:
@@ -399,6 +463,11 @@ func (g *golangciLint) Run(ctx context.Context, repoRoot string, files []string)
 	for _, t := range targets {
 		args := []string{"run", "--config", configRef}
 		args = append(args, golangciReportArgs...)
+		// Always, including when the operator supplied golangci_config: a file
+		// with default: none or gosec disabled must not report ran without it.
+		if g.ForceGosec {
+			args = append(args, "--enable=gosec")
+		}
 		args = append(args, "--")
 		args = append(args, t.Dirs...)
 
@@ -432,7 +501,7 @@ func (g *golangciLint) Run(ctx context.Context, repoRoot string, files []string)
 
 // findings converts one golangci-lint report into findings.
 //
-// The note behind it is in docs/analyzers.md#findings.
+// The note behind it is in docs/runner-notes.md#findings.
 func (g *golangciLint) findings(out []byte, exit int) ([]Finding, error) {
 	var parsed golangciOutput
 	if err := decodeJSON(out, &parsed); err != nil {
@@ -477,7 +546,7 @@ func (g *golangciLint) findings(out []byte, exit int) ([]Finding, error) {
 // golangciReportArgs are the flags that decide how much of golangci-lint's
 // report reaches this process, and how its positions are spelled.
 //
-// The note behind it is in docs/analyzers.md#golangcireportargs.
+// The note behind it is in docs/runner-notes.md#golangcireportargs.
 var golangciReportArgs = []string{
 	"--output.json.path", "stdout",
 	"--issues-exit-code", "0",
@@ -557,7 +626,7 @@ func goDirectiveLine(name string, src []byte) int {
 // scanning the packages that are about to be analyzed, and returns "" when it
 // can.
 //
-// The note behind it is in docs/analyzers.md#positionsrewritten.
+// The note behind it is in docs/runner-notes.md#positionsrewritten.
 func positionsRewritten(repoRoot string, targets []goTarget) string {
 	for _, t := range targets {
 		for _, d := range t.Dirs {
@@ -603,7 +672,7 @@ func positionsRewritten(repoRoot string, targets []goTarget) string {
 // covering is a runner that can name the parts of the change it did not
 // analyze, for an analyzer that otherwise ran and reported.
 //
-// The note behind it is in docs/analyzers.md#covering.
+// The note behind it is in docs/runner-notes.md#covering.
 type covering interface {
 	Uncovered(ctx context.Context, repoRoot string, files []string, diffs diff.Files) []review.LinterUncovered
 }
@@ -873,8 +942,8 @@ func (g *golangciLint) Uncovered(ctx context.Context, repoRoot string, files []s
 	for _, module := range modules {
 		mod := path.Join(module, "go.mod")
 
-		declared, line, ok := moduleLanguageVersion(filepath.Join(repoRoot, filepath.FromSlash(mod)))
-		if !ok || !belowAnalyzedLanguage(declared, goEnv.Language) {
+		declared, line, ok := gomod.LanguageVersion(filepath.Join(repoRoot, filepath.FromSlash(mod)))
+		if !ok || !gomod.BelowAnalyzed(declared, goEnv.Language) {
 			continue
 		}
 		out = append(out, review.LinterUncovered{
@@ -937,7 +1006,7 @@ func (g *golangciLint) notSelected(repoRoot string, files []string, diffs diff.F
 // cgoExcluded reports whether the go tool drops this file from its package
 // because it imports "C" while cgo is off.
 //
-// The note behind it is in docs/analyzers.md#cgoexcluded.
+// The note behind it is in docs/runner-notes.md#cgoexcluded.
 func cgoExcluded(file string, cgoEnabled bool) bool {
 	if cgoEnabled {
 		return false
@@ -956,70 +1025,6 @@ func cgoExcluded(file string, cgoEnabled bool) bool {
 		}
 	}
 	return false
-}
-
-// goAssumedLanguageVersion is what the go tool assumes for a module whose
-// go.mod
-// carries no `go` directive at all.
-//
-// The note behind it is in docs/analyzers.md#goassumedlanguageversion.
-const goAssumedLanguageVersion = "1.16"
-
-// belowAnalyzedLanguage reports whether a module's declared Go language
-// version
-// is below the toolchain analyzing it, so that version-gated checks this run
-// could have applied were not applied to it.
-//
-// The note behind it is in docs/analyzers.md#belowanalyzedlanguage.
-func belowAnalyzedLanguage(declared, ceiling string) bool {
-	v := "go" + declared
-	if !version.IsValid(v) || !version.IsValid(ceiling) {
-		return false
-	}
-	return version.Compare(version.Lang(v), version.Lang(ceiling)) < 0
-}
-
-// moduleLanguageVersion reads the Go language version a go.mod declares, with
-// the 1-based line of the `go` directive.
-//
-// The note behind it is in docs/analyzers.md#modulelanguageversion.
-func moduleLanguageVersion(modFile string) (declared string, line int, ok bool) {
-	src, err := os.ReadFile(modFile)
-	if err != nil {
-		return "", 0, false
-	}
-
-	// Parenthesis depth, so that a `go` line inside require/exclude/replace/
-	// retract/godebug/tool is read as what it is, a block entry, and not as the
-	// module's directive. Indentation cannot stand in for this: go.mod permits a
-	// top-level directive to be indented, which is why the scan below uses Fields
-	// in the first place.
-	depth := 0
-
-	for i, raw := range strings.Split(string(src), "\n") {
-		if comment := strings.Index(raw, "//"); comment >= 0 {
-			raw = raw[:comment]
-		}
-
-		// Fields rather than a split on " ": it absorbs leading indentation,
-		// which go.mod permits, and the trailing \r of a file written on Windows.
-		if fields := strings.Fields(raw); depth == 0 && len(fields) >= 2 && fields[0] == "go" {
-			return fields[1], i + 1, true
-		}
-
-		// After the check and not before it: `require (` opens the block on the
-		// line that names it, and the directive itself never carries a paren, so
-		// no top-level `go` is ever hidden by its own line.
-		depth += strings.Count(raw, "(") - strings.Count(raw, ")")
-		if depth < 0 {
-			// Unbalanced. The file does not load either, and guessing which of
-			// the two readings the author meant is how a misread becomes a
-			// number the ceiling comparison trusts.
-			return "", 0, false
-		}
-	}
-
-	return goAssumedLanguageVersion, 0, true
 }
 
 // goNolintLines returns the lines carrying a golangci-lint nolint directive.
@@ -1194,7 +1199,7 @@ func parentDir(d string) string {
 // repoPath turns a path an analyzer printed relative to its own working
 // directory back into one relative to the repository.
 //
-// The note behind it is in docs/analyzers.md#repopath.
+// The note behind it is in docs/runner-notes.md#repopath.
 func repoPath(repoRoot, module, reported string) string {
 	if filepath.IsAbs(reported) {
 		return relative(repoRoot, reported)
@@ -1302,7 +1307,7 @@ func (e *eslint) Name() string { return "eslint" }
 
 // Detect requires an operator-supplied config, so eslint is OFF by default.
 //
-// The note behind it is in docs/analyzers.md#detect.
+// The note behind it is in docs/runner-notes.md#detect.
 func (e *eslint) Detect(_ context.Context, repoRoot string, files []string) error {
 	if e.cfg.Err != nil {
 		return e.cfg.Err
@@ -1529,7 +1534,7 @@ func (s *semgrep) findings(out []byte, exit int) ([]Finding, error) {
 
 // mapSeverity translates an analyzer's severity vocabulary to ours.
 //
-// The note behind it is in docs/analyzers.md#mapseverity.
+// The note behind it is in docs/runner-notes.md#mapseverity.
 func mapSeverity(s string) config.Severity {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "CRITICAL":
@@ -1611,7 +1616,7 @@ func relativeTo(root, path string) (string, bool) {
 // REQUIRES
 // one.
 //
-// The note behind it is in docs/analyzers.md#decodejson.
+// The note behind it is in docs/runner-notes.md#decodejson.
 func decodeJSON(out []byte, target any) error {
 	trimmed := trimToJSON(out)
 	if len(trimmed) == 0 {

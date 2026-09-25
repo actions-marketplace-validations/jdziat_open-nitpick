@@ -80,13 +80,13 @@ func TestAlreadyReportedMatchesByFingerprintOrPlace(t *testing.T) {
 	}
 }
 
-func TestIncrementalReviewReadsOnlyChangedFilesAndWithholdsPosted(t *testing.T) {
+func TestStandingFindingsAreRecheckedWithoutDuplicateComments(t *testing.T) {
 	appFinding := Finding{
 		Path: "app.go", Line: 4, Severity: "error", Category: "correctness", Class: "correctness",
 		Title: "Ignored error from http.Get", Rationale: "resp may be nil, so the deferred Close panics.",
 	}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "Adds a retry path.", Findings: []Finding{appFinding}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "Adds a retry path.", Verdicts: verdictsFor([]Finding{appFinding})}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{appFinding}}),
 	}}
 	provider := &incrementalProvider{
@@ -107,16 +107,11 @@ func TestIncrementalReviewReadsOnlyChangedFilesAndWithholdsPosted(t *testing.T) 
 	if report.Incremental == nil {
 		t.Fatal("expected an incremental note")
 	}
-	if got := strings.Join(report.Incremental.Reviewed, ","); got != "app.go" {
-		t.Errorf("reviewed = %q, want only the file that moved", got)
+	if got := strings.Join(report.Incremental.Reviewed, ","); got != "app.go,other.go" {
+		t.Errorf("reviewed = %q, want the whole change while prior findings stand", got)
 	}
-	if got := strings.Join(report.Incremental.Unchanged, ","); got != "other.go" {
-		t.Errorf("unchanged = %q", got)
-	}
-	for _, p := range model.prompts() {
-		if strings.Contains(p, "other.go") {
-			t.Error("a file unchanged since the last review was sent to the model")
-		}
+	if len(report.Incremental.Unchanged) != 0 {
+		t.Errorf("unread files = %v", report.Incremental.Unchanged)
 	}
 
 	if len(report.Findings) != 0 || len(report.AlreadyReported) != 1 {
@@ -129,7 +124,7 @@ func TestIncrementalReviewReadsOnlyChangedFilesAndWithholdsPosted(t *testing.T) 
 		t.Errorf("published head = %q", provider.published.Head)
 	}
 	if !strings.Contains(provider.published.Summary, "already posted") ||
-		!strings.Contains(provider.published.Summary, "changed since the review at `old`") {
+		!strings.Contains(provider.published.Summary, "Rechecked the whole change") {
 		t.Errorf("summary does not disclose the incremental review:\n%s", provider.published.Summary)
 	}
 	if len(provider.published.Comments) != 0 {
@@ -181,7 +176,7 @@ func TestIncrementalCanBeSwitchedOff(t *testing.T) {
 func TestPublishedCommentsCarryFingerprints(t *testing.T) {
 	f := Finding{Path: "app.go", Line: 4, Severity: "error", Class: "correctness", Title: "Ignored error"}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "s", Findings: []Finding{f}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{f})}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{f}}),
 	}}
 	provider := &stubProvider{diff: engineDiff}
@@ -200,7 +195,7 @@ func TestPublishedCommentsCarryFingerprints(t *testing.T) {
 func TestAReviewThatCannotBePublishedIsStillReturned(t *testing.T) {
 	f := Finding{Path: "app.go", Line: 4, Severity: "error", Class: "correctness", Title: "Ignored error"}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "s", Findings: []Finding{f}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{f})}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{f}}),
 	}}
 	provider := &stubProvider{diff: engineDiff, err: errors.New("403 forbidden")}
@@ -227,7 +222,7 @@ func TestTriageMayNotLoseAFindingSilently(t *testing.T) {
 	// listed with the number it merges into. Line 5 is #2 after sorting.
 	listed := Finding{Path: "app.go", Line: 5, Severity: "warning", Class: "concurrency", Title: "Speculative", Rationale: "The nil response from the failed Get is closed."}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings": mustJSON(t, Result{Summary: "s", Findings: []Finding{kept},
+		"triaging findings": mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{kept}),
 			Dropped: []Drop{{Number: 2, DuplicateOf: 1, Reason: "same nil response, one line down"}}}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{kept, lost, listed}}),
 	}}
@@ -269,7 +264,7 @@ func TestMultiLineSuggestionsAreCommittableOnlyWhenValidated(t *testing.T) {
 	same := Finding{Path: "app.go", Line: 4, Severity: "info", Class: "maintainability", Title: "Identical",
 		Suggestion: "\tresp, _ := http.Get(\"http://x\")\n\tdefer resp.Body.Close()", FixEndLine: 5}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "s", Findings: []Finding{good, outside, same}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{good, outside, same})}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{good, outside, same}}),
 	}}
 	provider := &stubProvider{diff: engineDiff}
@@ -315,6 +310,59 @@ func (p *resolvingProvider) ResolveThreads(_ context.Context, _ vcs.Ref, ids []i
 	return ids, nil
 }
 
+// A clean completed recheck under review.approve resolves every earlier
+// comment thread and submits APPROVE. Without the resolve step, standing
+// threads hold the review at COMMENT forever; without APPROVE, a green
+// check still leaves the pull request looking unreviewed.
+func TestCleanApproveResolvesStandingCommentsAndApproves(t *testing.T) {
+	provider := &resolvingProvider{incrementalProvider: incrementalProvider{
+		stubProvider: stubProvider{diff: engineDiff},
+		head:         "beef02",
+		prior: &vcs.PriorReview{Head: "beef01", Comments: []vcs.PriorComment{
+			{ID: 1, Path: "app.go", Line: 4, Fingerprint: "abcd", Class: "correctness"},
+			{ID: 2, Path: "app.go", Line: 2, Fingerprint: "beef", Class: "style"},
+		}},
+	}}
+	report, err := newEngine(t, &scriptedLLM{fallback: `{"findings":[]}`}, provider, func(c *config.Config) {
+		c.Review.Approve.Enabled = true
+	}).Review(context.Background(), vcs.Ref{})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if got := fmt.Sprint(provider.resolved); got != "[1 2]" {
+		t.Errorf("resolved = %s, want every standing thread closed before approval", got)
+	}
+	if len(report.Superseded) != 2 {
+		t.Errorf("superseded = %d, want 2", len(report.Superseded))
+	}
+	if provider.published == nil || provider.published.Event != vcs.EventApprove {
+		t.Fatalf("published event = %v, want APPROVE", provider.published)
+	}
+}
+
+// Standing comments on the same head force a full Recheck (not the empty
+// same-head skip). Under review.approve the recheck that finds nothing
+// resolves those threads and submits APPROVE.
+func TestSameHeadStandingCommentsAreRecheckedThenApproved(t *testing.T) {
+	provider := &resolvingProvider{incrementalProvider: incrementalProvider{
+		stubProvider: stubProvider{diff: engineDiff},
+		head:         "deadbeef",
+		prior: &vcs.PriorReview{Head: "deadbeef", Comments: []vcs.PriorComment{
+			{ID: 1, Path: "app.go", Line: 4, Fingerprint: "abcd", Class: "correctness"},
+		}},
+	}}
+	report, err := newEngine(t, &scriptedLLM{fallback: `{"findings":[]}`}, provider, func(c *config.Config) {
+		c.Review.Approve.Enabled = true
+	}).Review(context.Background(), vcs.Ref{})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if len(provider.resolved) != 1 || provider.published == nil || provider.published.Event != vcs.EventApprove {
+		t.Fatalf("resolved=%v event=%v prior=%d superseded=%d files=%d",
+			provider.resolved, provider.published, report.PriorComments, len(report.Superseded), report.Plan.Files())
+	}
+}
+
 // An earlier comment whose file was re-read and whose finding did not recur
 // is resolved with a reply; one whose finding recurred is not, nor is one
 // on a file this run did not re-read, since nothing there was checked. A
@@ -329,7 +377,7 @@ func TestIncrementalRunResolvesSupersededComments(t *testing.T) {
 	elsewhere := Finding{Path: "other.go", Line: 3, Class: "style", Title: "Unread file nit"}
 	outdated := Finding{Path: "other.go", Line: 9, Class: "resource", Title: "Body not closed"}
 	model := &scriptedLLM{byPrompt: map[string]string{
-		"triaging findings":            mustJSON(t, Result{Summary: "s", Findings: []Finding{appFinding}}),
+		"triaging findings":            mustJSON(t, TriageResult{Summary: "s", Verdicts: verdictsFor([]Finding{appFinding})}),
 		"Review the following changes": mustJSON(t, Result{Findings: []Finding{appFinding}}),
 	}}
 	provider := &resolvingProvider{incrementalProvider: incrementalProvider{
@@ -349,13 +397,13 @@ func TestIncrementalRunResolvesSupersededComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
-	if got := fmt.Sprint(provider.resolved); got != "[2 4]" {
+	if got := fmt.Sprint(provider.resolved); got != "[2 3 4]" {
 		t.Errorf("resolved = %s, want the superseded comment on the re-read file and the outdated one", got)
 	}
-	if len(report.Superseded) != 2 || !strings.Contains(provider.reply, "did not recur") || !strings.Contains(provider.reply, "old") {
+	if len(report.Superseded) != 3 || !strings.Contains(provider.reply, "did not recur") || !strings.Contains(provider.reply, "old") {
 		t.Errorf("superseded = %+v, reply = %q", report.Superseded, provider.reply)
 	}
-	if !strings.Contains(Render(report, report.Files, newEngine(t, model, provider, nil).Config).Summary, "2 earlier comment thread(s) were resolved") {
+	if !strings.Contains(Render(report, report.Files, newEngine(t, model, provider, nil).Config).Summary, "3 earlier comment thread(s) were resolved") {
 		t.Error("the notice does not say the threads were resolved")
 	}
 

@@ -49,9 +49,10 @@ func Render(report *Report, files diff.Files, cfg *config.Config) vcs.Review {
 	}
 
 	review := vcs.Review{
-		Event:    reviewEvent(report, cfg),
-		Comments: make([]vcs.Comment, 0, len(report.Findings)),
-		Head:     report.Head,
+		Event:      reviewEvent(report, cfg),
+		Comments:   make([]vcs.Comment, 0, len(report.Findings)),
+		Head:       report.Head,
+		Incomplete: !report.reusableCoverage(),
 	}
 
 	// What this run was priced at, recorded with the review so a later run
@@ -202,6 +203,46 @@ func renderComment(f Finding, emoji bool, read map[string][]string) string {
 		fmt.Fprintf(&b, "\n<sub>%s</sub>\n", attribution)
 	}
 
+	// Stated doubt, on the same footing as the attribution above it and for the
+	// same reason: a reader deciding whether to act wants to know that the
+	// expert check ran and came back undecided, which is otherwise
+	// indistinguishable from the check having agreed.
+	//
+	// Flattened and escaped, because the expert wrote it after reading a diff
+	// the change's author controls. A newline puts what follows at column 0,
+	// outside the <sub> meant to hold it; a `</sub>` closes the element and
+	// whatever follows renders as live HTML in a comment posted under this
+	// tool's name. Same call every other model-authored string here makes.
+	if u := inline(strings.TrimSpace(f.Unresolved)); u != "" {
+		// The expert's name is set beside the reason on every path that writes
+		// one, so an empty one is a caller that built the finding by hand. It
+		// still must not render "resolved by : ".
+		if by := inline(strings.TrimSpace(f.UnresolvedBy)); by != "" {
+			fmt.Fprintf(&b, "\n<sub>could not be resolved by %s: %s</sub>\n", by, u)
+		} else {
+			fmt.Fprintf(&b, "\n<sub>could not be resolved: %s</sub>\n", u)
+		}
+	}
+
+	// What the reviewer read, so a reader can go and look. Ids only: the
+	// entries ship in this repository under internal/knowledge/corpus, and a
+	// reader who wants the text has a filename. It is not a claim that any of
+	// them produced the finding, which is why the line says "read", see
+	// evidence.go.
+	//
+	// Every id resolves to a file, and nothing here checks that, because
+	// nothing here could be wrong about it: Evidence is json:"-" and is filled
+	// from the entries retrieval returned, which are the corpus. A model can
+	// neither write the field nor name an entry that is not in it. See
+	// TestEvidenceIsOnlyEverCorpusIDs.
+	if len(f.Evidence) > 0 {
+		read := make([]string, 0, len(f.Evidence))
+		for _, id := range f.Evidence {
+			read = append(read, "`"+inline(id)+"`")
+		}
+		fmt.Fprintf(&b, "\n<sub>reference read: %s</sub>\n", strings.Join(read, ", "))
+	}
+
 	// A GitHub suggestion block is one click to apply. Which makes it the most
 	// valuable thing a review bot offers and the most damaging thing it can get
 	// wrong. A suggestion is only rendered as applicable code when it plausibly
@@ -343,6 +384,7 @@ func renderSummary(report *Report, cfg *config.Config) string {
 	// findings, these skips and these budgets are the product of a policy that
 	// is not the one in the change.
 	b.WriteString(policyNotice(report))
+	b.WriteString(unknownKeyNotice(report))
 	b.WriteString(incrementalNotice(report))
 	b.WriteString(nothingReviewedNotice(report))
 	b.WriteString(linterNotice(report))
@@ -353,6 +395,10 @@ func renderSummary(report *Report, cfg *config.Config) string {
 	// what was reviewed is a fact about coverage, and review.summary turning
 	// the walkthrough off must not turn it into a silent trim.
 	b.WriteString(budgetNote(report))
+	// Same rule, same reason. A stage that did not run is a fact about what
+	// the findings below have been through, and review.summary is a setting
+	// about prose.
+	b.WriteString(stageNotice(report))
 	b.WriteString(EscalationNotice(report))
 
 	if cfg == nil || cfg.Review.Summary {
@@ -368,6 +414,9 @@ func renderSummary(report *Report, cfg *config.Config) string {
 		b.WriteString("\n</details>\n")
 	}
 
+	if report.Practices != nil {
+		b.WriteString("\n\n<details><summary>Engineering practices</summary>\n\n<pre>" + html.EscapeString(report.Practices.Text()) + "</pre>\n\n</details>")
+	}
 	out := strings.TrimSpace(b.String())
 	if out == "" {
 		return ""
@@ -395,6 +444,8 @@ func incrementalNotice(report *Report) string {
 			since = since[:7]
 		}
 		switch {
+		case inc.Recheck:
+			fmt.Fprintf(&b, "**Rechecked the whole change because findings from the review at `%s` remain.**\n", since)
 		case len(inc.Reviewed) == 0:
 			fmt.Fprintf(&b, "**Nothing in this change has moved since the review at `%s`.**\n", since)
 		default:
@@ -497,6 +548,40 @@ func policyNotice(report *Report) string {
 			"for reviews after it lands. To try it out first, pass `-config` a copy kept\n"+
 			"outside the repository.",
 		inline(report.Policy.Modified), report.Policy.Source()))
+}
+
+// unknownKeyNotice states, on the pull request, which config keys this build
+// does not have and therefore did not apply.
+//
+// Beside policyNotice for its reason: a setting a reader believes is in force
+// and is not changes how every finding below should be read. It is published
+// rather than only logged because the person who wrote the key reads the pull
+// request, and the operator who set the environment variable reads the CI log.
+//
+// The keys were ignored on that operator's word that the binary is behind the
+// config. Nothing here can check that, so the notice says what was ignored and
+// leaves the reading to whoever knows which it was.
+func unknownKeyNotice(report *Report) string {
+	cfg := report.Policy.Config
+	if cfg == nil || len(cfg.Unknown) == 0 {
+		return ""
+	}
+
+	// inline escapes HTML and flattens, and does not neutralise markdown: a
+	// backtick in the key closes the code span and what follows renders as
+	// markdown, a link included, in a comment posted under this tool's name.
+	// The key is bytes the change under review chose. A config key never
+	// contains one, so replacing it costs a reader nothing and closes the span.
+	keys := make([]string, 0, len(cfg.Unknown))
+	for _, k := range cfg.Unknown {
+		keys = append(keys, "`"+inline(strings.ReplaceAll(k, "`", "'"))+"`")
+	}
+	return blockquote(fmt.Sprintf(
+		"**This nitpick does not have %s.**\n"+
+			"They were ignored rather than failing the run, because %s is set.\n"+
+			"A key added to a newer nitpick reads exactly like a typo here, so if one of\n"+
+			"these is a typo it is doing nothing.",
+		strings.Join(keys, ", "), config.EnvIgnoreUnknownKeys))
 }
 
 // linterNotice states, ON THE PULL REQUEST, what each deterministic analyzer
@@ -912,11 +997,11 @@ func overruledNotes(report *Report) string {
 			// (a ceiling of warning rendering "re-rated this from critical" as
 			// though critical had been published), so the level printed here is
 			// the one that WAS published for this finding.
-			fmt.Fprintf(&b, "  - %s re-rated this from %s to %s, below this repository's minimum severity: %s\n",
-				inline(r.Expert), r.Finding.Sev(), r.Revised, inline(r.Reason))
+			fmt.Fprintf(&b, "  - %s re-rated this from %s to %s, below this repository's minimum severity: %s%s\n",
+				inline(r.Expert), r.Finding.Sev(), r.Revised, inline(r.Reason), citedNote(r))
 			continue
 		}
-		fmt.Fprintf(&b, "  - %s: %s\n", inline(r.Expert), inline(r.Reason))
+		fmt.Fprintf(&b, "  - %s: %s%s\n", inline(r.Expert), inline(r.Reason), citedNote(r))
 	}
 
 	return b.String()
@@ -997,7 +1082,11 @@ func groupByReason(skips []bundle.Skip, omit string) string {
 
 	var b strings.Builder
 	for _, reason := range order {
-		fmt.Fprintf(&b, "- %s: %s\n", reason, strings.Join(byReason[reason], ", "))
+		paths := make([]string, len(byReason[reason]))
+		for i, p := range byReason[reason] {
+			paths[i] = inline(p)
+		}
+		fmt.Fprintf(&b, "- %s: %s\n", inline(reason), strings.Join(paths, ", "))
 	}
 	return b.String()
 }
@@ -1052,4 +1141,33 @@ func budgetNote(report *Report) string {
 	}
 
 	return b.String()
+}
+
+// stageNotice reports a required stage that did not complete.
+//
+// Ungated, beside budgetNote and for its reason: review.summary chooses
+// whether a model's prose is published, and a reader who turned that off has
+// not asked to stop being told the findings were never ranked.
+func stageNotice(report *Report) string {
+	if len(report.Stages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n> **This review did not complete.**\n>\n")
+	for _, st := range report.Stages {
+		fmt.Fprintf(&b, "> - %s\n", inline(stageSentence(st)))
+	}
+	return b.String()
+}
+
+// citedNote names the reference entry an expert said decided its verdict.
+//
+// Rendered wherever a reason is, because the reason is the claim and this is
+// what it rests on. A citation naming an entry the expert was not shown never
+// reaches here: it is dropped at the verdict, see citation.
+func citedNote(r Overruled) string {
+	if r.Cited == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (citing `%s`)", inline(r.Cited))
 }

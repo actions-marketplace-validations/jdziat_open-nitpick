@@ -34,7 +34,12 @@ const improveMaxListed = 40
 
 // runImprove reviews the change again at pedantic scope with slop on, and
 // posts what it found as one comment.
-func runImprove(ctx context.Context, gh *vcs.GitHub, cfg *config.Config, ref vcs.Ref, ev *converse.Event, log *slog.Logger) error {
+// repo is the checkout the diff's paths are relative to. Taken rather than read
+// off gh.Checkout, which is set only when the root holds a .git. Empty, the
+// resolver refuses and this pass fails loudly. Divergent and non-empty is the
+// case worth avoiding: SelfModified would find no config under that root,
+// answer false, and review under the change's own configuration.
+func runImprove(ctx context.Context, gh *vcs.GitHub, repo string, cfg *config.Config, ref vcs.Ref, ev *converse.Event, log *slog.Logger) error {
 	// No permission gate beyond the association check the caller already ran.
 	// This command reads and comments; runFix refuses more because it writes.
 
@@ -64,14 +69,61 @@ func runImprove(ctx context.Context, gh *vcs.GitHub, cfg *config.Config, ref vcs
 	// wants the whole change looked at, and wants no threads touched.
 	held := &heldReview{inner: gh}
 
+	// Retrieval, on the defect pass only. The style pass declines it inside
+	// the engine: it re-reviews the same batches with a style prompt, and a
+	// corpus about correctness defects handed to a style reviewer buys a
+	// second embedding call per batch and nothing else.
+	//
+	// Fatal on a construction error, matching every other command: the
+	// operator asked for retrieval, so a broken embedder is a configuration
+	// answer rather than a review that quietly did less than it said.
+	k, status, err := review.BuildKnowledge(ctx, &icfg, gh.Checkout, log)
+	if err != nil {
+		return fmt.Errorf("knowledge retrieval (%s): %w", status.Reason, err)
+	}
+
+	// The wider pass reads the same measured conventions, and gets the style
+	// half of them. improve resolves its own policy just below, so the base
+	// revision here is the one that resolution used.
+	std, stdStatus := review.BuildStandards(ctx, &icfg, gh.Checkout,
+		baseRevisionFor(ctx, gh, ref, log), log)
+
 	engine := &review.Engine{
-		Config:   &icfg,
-		Roles:    roles,
-		Provider: held,
-		Log:      log,
+		Standards:       std,
+		StandardsStatus: stdStatus,
+
+		Config:    &icfg,
+		Roles:     roles,
+		Provider:  held,
+		Log:       log,
+		Knowledge: k,
+
+		// Both fields, as newEngine wires them. Policy alone would record a
+		// substitution and then review under the change's own models, because
+		// withPolicy rebuilds the roles through Models and leaves the engine
+		// untouched when it is nil.
+		//
+		// This pass is the widest of the three a mention can start. It is a
+		// whole review, so review.ignore, min_severity, validation, the budgets
+		// and instructions[].prompt all reach it, and no permission gate stands
+		// in front of it.
+		//
+		// The scope is applied by the resolver rather than here, because
+		// withPolicy replaces Config wholesale with whatever the resolver
+		// returned. Scoping only the roles would leave a substituted policy
+		// reviewing at the ordinary scope, which is a pass that says it was
+		// pedantic and was not.
+		Policy: improveScoped{&config.BasePolicy{RepoRoot: repo, Loaded: &icfg, Provider: gh}},
+		Models: llm.BuildRoles,
 		// Linters stays nil. The analyzers are deterministic and the ordinary
 		// review already ran them; a second run would spend time to publish
 		// what is already on the pull request.
+	}
+
+	// Before Review: fail-closed must not discard a completed pass.
+	prior, err := gh.PriorReview(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("read the prior review before posting: %w", err)
 	}
 
 	report, err := engine.Review(ctx, ref)
@@ -92,13 +144,6 @@ func runImprove(ctx context.Context, gh *vcs.GitHub, cfg *config.Config, ref vcs
 		findings = scoped
 	}
 
-	// A failure to read what is already published is not a failure of the
-	// pass: the worst outcome is repeating something already said, and losing
-	// the whole answer to avoid that is the worse trade.
-	prior, err := gh.PriorReview(ctx, ref)
-	if err != nil {
-		log.Warn("could not read the prior review, so this pass may repeat a published finding", "error", err)
-	}
 	findings = dropPublished(findings, prior)
 
 	body := improveComment(findings, ev, len(report.Findings))
@@ -229,4 +274,26 @@ func applyImproveScope(cfg *config.Config) {
 // that argues for it existing separately.
 func runImproveCLI(ctx context.Context, args []string) error {
 	return reviewWithScope(ctx, "improve", args, applyImproveScope)
+}
+
+// improveScoped applies the improve scope to whatever policy is resolved.
+//
+// The engine replaces its whole Config with the resolver's answer, so a scope
+// applied anywhere else is lost the moment a substitution happens, and the
+// substitution happens on exactly the change a maintainer is most likely to
+// type `improve` on: the one editing the configuration.
+type improveScoped struct{ inner review.PolicyResolver }
+
+func (i improveScoped) ResolvePolicy(ctx context.Context, ref vcs.Ref, pr *vcs.PullRequest,
+	changed []string) (*config.Config, bool, error) {
+
+	cfg, modified, err := i.inner.ResolvePolicy(ctx, ref, pr, changed)
+	if cfg == nil {
+		return cfg, modified, err
+	}
+	scoped := *cfg
+	applyImproveScope(&scoped)
+	scoped.Review.ResolveSuperseded = false
+	scoped.Review.Approve.Enabled = false
+	return &scoped, modified, err
 }

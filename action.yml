@@ -7,6 +7,9 @@ branding:
   color: purple
 
 inputs:
+  bot-login:
+    description: "Trusted posting account; use <app-slug>[bot] for an App token"
+    default: github-actions[bot]
   github-token:
     description: >-
       Token used to read the pull request and publish the review. The default
@@ -109,6 +112,18 @@ outputs:
     description: Number of findings published.
     value: ${{ steps.review.outputs.findings }}
 
+  practice_findings:
+    description: >-
+      Findings retained in the engineering practice report, including advisory
+      findings and accepted exceptions. May overlap inline findings.
+    value: ${{ steps.review.outputs.practice_findings }}
+
+  practice_blocking:
+    description: >-
+      Engineering policy violations without an accepted exception or unresolved
+      uncertainty.
+    value: ${{ steps.review.outputs.practice_blocking }}
+
   critical:
     description: Findings at critical.
     value: ${{ steps.review.outputs.critical }}
@@ -128,6 +143,21 @@ outputs:
   withheld:
     description: Findings withheld because an earlier review already posted them.
     value: ${{ steps.review.outputs.withheld }}
+
+  complete:
+    description: >-
+      Whether the selected policy's required assessment completed. Ordinary
+      reviews require every planned file and stage; the engineering profile
+      uses practices.required and reports optional failures separately.
+      False sets result to "error" and exits 2 regardless of fail-on.
+    value: ${{ steps.review.outputs.complete }}
+
+  failed_stages:
+    description: >-
+      Comma-separated names of model stages that did not complete, empty when
+      none did. Under the engineering profile these can be optional; use
+      complete and the practice report to determine policy satisfaction.
+    value: ${{ steps.review.outputs.failed_stages }}
 
 runs:
   using: composite
@@ -331,6 +361,7 @@ runs:
       # arbitrary commands in this step.
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        NITPICK_BOT_LOGIN: ${{ inputs.bot-login }}
         LLM_PROVIDER: ${{ inputs.provider }}
         LLM_MODEL: ${{ inputs.model }}
         LLM_API_KEY: ${{ inputs.api-key }}
@@ -344,6 +375,8 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         NITPICK_COMMAND: ${{ inputs.command }}
         EVENT_BEFORE: ${{ github.event.before }}
+        MERGE_BASE: ${{ github.event.merge_group.base_sha }}
+        MERGE_HEAD: ${{ github.event.merge_group.head_sha }}
         HEAD_SHA: ${{ github.sha }}
         IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
       run: |
@@ -392,7 +425,15 @@ runs:
         # one through pr-number; a push has no pull request and is reviewed as
         # the pushed range, printed rather than posted.
         case "$EVENT_NAME" in
-          pull_request|pull_request_target|merge_group)
+          pull_request|pull_request_target)
+            ;;
+          merge_group)
+            if [ -z "$MERGE_BASE" ] || [ -z "$MERGE_HEAD" ]; then
+              echo "::error::open-nitpick: merge_group requires base and head SHAs"
+              echo "result=error" >> "$GITHUB_OUTPUT"
+              exit 2
+            fi
+            flags+=(-base "$MERGE_BASE" -head "$MERGE_HEAD")
             ;;
           push)
             base="$EVENT_BEFORE"

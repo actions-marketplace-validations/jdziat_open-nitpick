@@ -237,7 +237,7 @@ func TestUnreadableReportIsAnErrorNotACleanRun(t *testing.T) {
 }
 
 // Parser samples, in each tool's documented machine format.
-func TestCatalogParsers(t *testing.T) {
+func TestCatalogParsersDecodeToolReports(t *testing.T) {
 	inv := invocation{repoRoot: "/repo", files: []string{"x"}}
 	cases := []struct {
 		tool     string
@@ -345,6 +345,21 @@ func TestOSVScannerKeepsAdvisoriesWithoutARegion(t *testing.T) {
 	}
 }
 
+func TestGitleaksRuleClassIsSecurityNotResource(t *testing.T) {
+	// Mutation: matching "leak" before gitleaks classed gitleaks(…) as
+	// resource, so partitionSecurityFindings hid every credential finding.
+	got := classForRule(prefixRule("gitleaks", "private-key"))
+	if got != config.ClassSecurity {
+		t.Fatalf("gitleaks rule class = %s, want security", got)
+	}
+	if got := classForRule("memleak"); got != config.ClassResource {
+		t.Fatalf("memleak class = %s, want resource", got)
+	}
+	if got := classForRule("goleak"); got != config.ClassResource {
+		t.Fatalf("goleak class = %s, want resource", got)
+	}
+}
+
 func TestGitleaksNeverReportsTheSecret(t *testing.T) {
 	inv := invocation{repoRoot: "/repo", tmpDir: t.TempDir(), files: []string{"config.yaml"}}
 	report := `[{"Description":"AWS Access Key","StartLine":4,"Secret":"AKIAIOSFODNN7EXAMPLE","Match":"AKIAIOSFODNN7EXAMPLE","File":"config.yaml","RuleID":"aws-access-token"}]`
@@ -439,16 +454,13 @@ func TestAutoDetectedToolsSkipWhenAbsentAndRunWhenPresent(t *testing.T) {
 	}
 }
 
-// TestSQLFluffParseFailuresAreNotFindings: a PRS violation is sqlfluff saying
+// TestSQLFluffParseFailuresInvalidateAnalysis: a PRS violation is sqlfluff saying
 // the dialect is wrong for this file, and "unparsable SQL" on a valid
 // migration is not a review finding.
-func TestSQLFluffParseFailuresAreNotFindings(t *testing.T) {
+func TestSQLFluffParseFailuresInvalidateAnalysis(t *testing.T) {
 	report := `[{"filepath":"m.sql","violations":[{"start_line_no":10,"code":"PRS","description":"Unparsable section"},{"start_line_no":3,"code":"CP02","description":"Unquoted identifiers must be consistently lower case","name":"capitalisation.identifiers"}]}]`
 	findings, err := specByName(t, "sqlfluff").parse(invocation{}, []byte(report), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(findings) != 1 || findings[0].Rule != "CP02" {
-		t.Errorf("findings = %+v; the parse failure must be dropped and the real rule kept", findings)
+	if err == nil || len(findings) != 0 {
+		t.Fatalf("unparsed file reported as analyzed: findings=%v error=%v", findings, err)
 	}
 }

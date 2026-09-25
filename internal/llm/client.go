@@ -56,6 +56,10 @@ type Client struct {
 	// fallback is the client a caller escalates to when this one cannot
 	// answer. Nil when the spec names none. See ShouldEscalate.
 	fallback *Client
+
+	// retries receives the SDK's retry callback. Nil on a client built for a
+	// test, which bypasses the resilience wrapper entirely.
+	retries *retryLog
 }
 
 // Provider returns the configured provider name.
@@ -85,28 +89,9 @@ func BuildContext(ctx context.Context, spec config.ModelSpec) (*Client, error) {
 		return nil, err
 	}
 
-	cfg := llms.Config{
-		Model:   strings.TrimSpace(spec.Model),
-		BaseURL: strings.TrimSpace(spec.BaseURL),
-		Timeout: spec.Timeout,
-		Extra:   spec.Extra,
-
-		// Opt-in only. Providers that target localhost by design (ollama,
-		// llamacpp) enable this themselves, so leaving it off here does not
-		// break the ordinary local-model path.
-		AllowPrivateIPs: spec.AllowPrivateEndpoint,
-		// The SDK split plain-HTTP from private-IP access in v5; the config
-		// documents allow_private_endpoint as granting both.
-		AllowHTTP: spec.AllowPrivateEndpoint,
-	}
-	// Credential resolution: the keystore and a secret manager before the
-	// environment, and the SDK's own conventional variable only when none of
-	// them said anything. See credential.go for the order and why.
-	switch key, ok, err := resolveCredential(ctx, spec, nil); {
-	case err != nil:
-		return nil, fmt.Errorf("model %s/%s: %w", spec.Provider, spec.Model, err)
-	case ok:
-		cfg.APIKey = key
+	cfg, err := providerConfig(ctx, spec)
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := llms.New(spec.Provider, cfg)
@@ -128,14 +113,20 @@ func BuildContext(ctx context.Context, spec config.ModelSpec) (*Client, error) {
 	if spec.MaxRetries != nil {
 		maxRetries = *spec.MaxRetries
 	}
-	resilient := resilience.NewResilientClient(client, resilience.WithMaxRetries(maxRetries))
+	// The retry observer is built here because the resilient client needs it
+	// and the Client needs the resilient client, so the logger cannot be known
+	// yet. It arrives later through setLog.
+	rl := &retryLog{model: spec.Provider + "/" + spec.Model}
+	resilient := resilience.NewResilientClient(client,
+		resilience.WithMaxRetries(maxRetries),
+		resilience.WithOnRetry(rl.observe))
 
 	mode := spec.StructuredOutput
 	if mode == "" {
 		mode = config.StructuredAuto
 	}
 
-	return &Client{LLM: resilient, Spec: spec, mode: mode, stallRetries: maxRetries, fallback: fallback}, nil
+	return &Client{LLM: resilient, Spec: spec, mode: mode, stallRetries: maxRetries, fallback: fallback, retries: rl}, nil
 }
 
 // NewClientForTest wraps an arbitrary SDK client, bypassing provider
@@ -285,8 +276,18 @@ func (r *Roles) WithLogger(l *slog.Logger) *Roles {
 func (c *Client) setLog(l *slog.Logger) {
 	for ; c != nil; c = c.fallback {
 		c.Log = l
+		if c.retries != nil {
+			c.retries.set(l)
+		}
 	}
 }
+
+// SetLogger points this client, its fallback and their retry observers at l.
+//
+// Exported because not every client comes from Roles: fix and respond build
+// one directly, and assigning the Log field alone leaves the SDK's retries
+// writing nowhere, which is the silence this observer exists to end.
+func (c *Client) SetLogger(l *slog.Logger) { c.setLog(l) }
 
 // logger is Log, or a discarding logger.
 func (c *Client) logger() *slog.Logger {
@@ -368,6 +369,9 @@ func (c *Client) CallOptions() []llms.CallOption {
 	if c.Spec.Temperature != nil {
 		opts = append(opts, llms.WithTemperature(*c.Spec.Temperature))
 	}
+	if r, ok := reasoningOption(c.Spec.Reasoning); ok {
+		opts = append(opts, r)
+	}
 	if len(c.Spec.Providers) > 0 {
 		// OpenRouter's provider routing. "only" restricts the candidate set;
 		// "order" ranks whatever set the other filters leave, which is not the
@@ -398,6 +402,9 @@ func (c *Client) CallOptions() []llms.CallOption {
 		// asking the API what each model's maximum is.
 		opts = append(opts, llms.WithMaxTokens(anthropicUnsetMaxTokens))
 	}
+	if tier := strings.TrimSpace(c.Spec.ServiceTier); tier != "" {
+		opts = append(opts, llms.WithExtraBodyParam("service_tier", tier))
+	}
 
 	return opts
 }
@@ -411,3 +418,57 @@ const anthropicUnsetMaxTokens = 32768
 
 // Timeout returns the per-request timeout, or zero when unset.
 func (c *Client) Timeout() time.Duration { return c.Spec.Timeout }
+
+// providerConfig builds the SDK config for a spec, credential and all.
+//
+// Shared with the embedding client, which needs the same endpoint rules and
+// the same credential order and none of the chat machinery around them. Split
+// out rather than duplicated: a credential order that differs between two call
+// sites is one that will differ in the wrong direction eventually.
+func providerConfig(ctx context.Context, spec config.ModelSpec) (llms.Config, error) {
+	cfg := llms.Config{
+		Model:   strings.TrimSpace(spec.Model),
+		BaseURL: strings.TrimSpace(spec.BaseURL),
+		Timeout: spec.Timeout,
+		Extra:   spec.Extra,
+
+		// Opt-in only. Providers that target localhost by design (ollama,
+		// llamacpp) enable this themselves, so leaving it off here does not
+		// break the ordinary local-model path.
+		AllowPrivateIPs: spec.AllowPrivateEndpoint,
+		// The SDK split plain-HTTP from private-IP access in v5; the config
+		// documents allow_private_endpoint as granting both.
+		AllowHTTP: spec.AllowPrivateEndpoint,
+	}
+	// Credential resolution: the keystore and a secret manager before the
+	// environment, and the SDK's own conventional variable only when none of
+	// them said anything. See credential.go for the order and why.
+	switch key, ok, err := resolveCredential(ctx, spec, nil); {
+	case err != nil:
+		return llms.Config{}, fmt.Errorf("model %s/%s: %w", spec.Provider, spec.Model, err)
+	case ok:
+		cfg.APIKey = key
+	}
+	return cfg, nil
+}
+
+// reasoningOption renders a configured reasoning level as a call option.
+//
+// Unset sends nothing, so a model keeps whatever it does by default. That is
+// the shipped behaviour and the only one any number in docs/findings.md was
+// measured under: sending a level nobody asked for would change every
+// published result without changing the document that reports it.
+func reasoningOption(level config.ReasoningLevel) (llms.CallOption, bool) {
+	switch level {
+	case "":
+		return nil, false
+	case config.ReasoningOff:
+		// A portable "do not think". Providers with a boolean switch honour it
+		// verbatim; those that only take a budget see zero effort and zero
+		// tokens, which is the same request.
+		off := false
+		return llms.WithReasoning(llms.ReasoningConfig{Enabled: &off}), true
+	default:
+		return llms.WithReasoningEffort(llms.ReasoningEffort(level)), true
+	}
+}

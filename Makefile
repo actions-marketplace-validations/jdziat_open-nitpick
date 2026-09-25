@@ -42,7 +42,7 @@ test:
 # detector is not optional here.
 .PHONY: race
 race:
-	go test -race ./...
+	go test -race -p 1 ./...
 
 .PHONY: cover
 cover:
@@ -53,16 +53,49 @@ cover:
 # pages, and website/ for what only the site has (landing page, styling).
 # Staged into .website/ so every relative link in the repository resolves on
 # the site unchanged. Needs mkdocs-material (pip install mkdocs-material).
-.PHONY: docs docs-serve
-docs:
+# AGENTS.md carries the conventions this repository demonstrates, measured
+# rather than asserted, so a rule the code stops following stops being
+# published. Only the marked block is generated; the prose around it is ours.
+.PHONY: agents
+agents:
+	go run ./cmd/nitpick standards -agents AGENTS.md
+
+.PHONY: docs docs-serve docs-reference
+# The configuration reference is generated from the configuration, so a key
+# the loader accepts and the docs never mention cannot survive a build.
+docs-reference:
+	go run ./cmd/nitpick config-reference -o docs/configuration-reference.md
+
+docs: docs-reference
 	rm -rf .website && mkdir -p .website/docs
 	cp website/index.md .website/index.md
-	cp -r website/assets .website/assets
+	# Rejected logo concepts are not documentation and were reachable in
+	# production until this line. logo.jpg joined them: 94 KB of the published
+	# site that no page, template or stylesheet names.
+	cp -r website/assets .website/assets && rm -rf .website/assets/logo-candidates .website/assets/logo.jpg
 	printf -- '---\ntitle: Guide\n---\n' > .website/guide.md
-	sed -E '1s/^# open-nitpick$$/# Guide/; /^Documentation: <https:\/\/jdziat\.github\.io/d; /^The same documents are published at/d' README.md >> .website/guide.md
+	# The heading is on line 3, under the centred logo, so the address this
+	# substitution used to carry never matched and the Guide's h1 was the site's
+	# own name, two inches under the header that already says it. README.md has
+	# exactly one line reading `# open-nitpick`.
+	# The logo and the three badges are deleted with it. A 112px centred mark
+	# 150px below the header's own mark and wordmark, over a left-aligned h1,
+	# over three shields, is README furniture: it makes the second page a
+	# four-minute reader reaches read as a rehosted README, and the License
+	# badge is the third statement of what the footer already carries as
+	# "Apache-2.0". README.md on GitHub keeps all four lines.
+	sed -E 's/^# open-nitpick$$/# Guide/; /^<p align="center"><img src="website\/assets\/logo\.svg"/d; /^\[!\[/d; /^Documentation: <https:\/\/jdziat\.github\.io/d; /^The same documents are published at/d' README.md >> .website/guide.md
 	cp docs/*.md .website/docs/
-	for f in .website/docs/*.md; do sed -E 's#\]\(\.\./(internal|cmd|action|\.github)/#](https://github.com/jdziat/open-nitpick/blob/main/\1/#g' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; done
-	sed -E 's#\]\((internal|cmd|action|\.github)/#](https://github.com/jdziat/open-nitpick/blob/main/\1/#g; s#src="website/assets/#src="../assets/#g' .website/guide.md > .website/guide.md.tmp && mv .website/guide.md.tmp .website/guide.md
+	cp docs/configuration-reference.md .website/docs/configuration-reference.md
+	# SECURITY.md sits at the repository root, so its links are docs/-relative;
+	# staged beside the pages it points at, that prefix has to go.
+	sed -E 's#\]\(docs/#](#g' SECURITY.md > .website/docs/security.md
+	# ../README.md resolves for someone reading docs/ in the repository and
+	# names no file on the site, where the same document is staged as guide.md.
+	# Written the other way round it is the repository copy that breaks, and
+	# these pages are read in both places.
+	for f in .website/docs/*.md; do sed -E -e 's#\]\(\.\./(internal|cmd|action|notes|\.github)/#](https://github.com/jdziat/open-nitpick/blob/main/\1/#g' -e 's#\]\(\.\./README\.md#](../guide.md#g' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; done
+	sed -E 's#\]\((internal|cmd|action|notes|\.github)/#](https://github.com/jdziat/open-nitpick/blob/main/\1/#g' .website/guide.md > .website/guide.md.tmp && mv .website/guide.md.tmp .website/guide.md
 	mkdocs build
 
 docs-serve: docs
@@ -71,6 +104,7 @@ docs-serve: docs
 .PHONY: lint
 lint:
 	go vet ./...
+	go vet -tags=eval ./...
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	@if command -v golangci-lint >/dev/null; then \
 		golangci-lint run; \
@@ -120,7 +154,26 @@ TUNING := go-nil-deref,go-sql-injection,go-hardcoded-secret,python-command-injec
 # class the review never asks for.
 SLOP := go-slop-restating-comments,go-clean-why-comments,python-slop-swallowed-exception,python-clean-logged-and-reraised,ts-slop-chat-prose,ts-clean-doc-comment,go-slop-type-excluded-check,go-clean-real-guard,python-slop-test-asserts-nothing,python-clean-test-asserts
 
+# Security-persona tuning corpus (make eval-security). Harder than the 2026-09-18
+# bake-off: spent held-out plants are promoted here; clean-sql-allowlist is the
+# FP magnet; go-idor and php-clean-404 raise the bar. Global HELD_OUT ≠ this list.
+# Prior security held-out spend (removed-guard, bash-fixed-temp-path,
+# clean-sql-allowlist) is SPENT for generalization claims — do not re-spend it.
+SECURITY := go-sql-injection,go-hardcoded-secret,python-command-injection,python-timing-unsafe-hmac,python-secret-to-audit-log,multi-defect,bash-fixed-temp-path,removed-guard,php-forbidden-vs-404,go-idor-wrong-principal,clean-refactor,style-only,clean-sql-allowlist,php-clean-404-on-forbidden
+
+# Never-spent security held-out. Spend once with make eval-security-heldout.
+# Distinct from HELD_OUT. Includes silence twin python-hmac-bound-clean.
+SECURITY_HELD_OUT := python-expired-token-accepted,python-hmac-unbound-compare,python-hmac-bound-clean
+
+SECURITY_MODELS := openai/gpt-5.6-luna,openai/gpt-5.6-terra,anthropic/claude-sonnet-4.6,anthropic/claude-opus-5,google/gemini-3.5-flash,deepseek/deepseek-v4-pro,z-ai/glm-5.3-flash,moonshotai/kimi-k2.7-code
+
 CALLERS := go-error-identity-changed,go-clean-wrapped-sentinel,go-return-units-changed,python-precondition-added,python-clean-precondition-satisfied,ts-return-units-changed
+
+# Every fixture in evals.KnowledgeFixtures(): six plants whose defect needs one
+# specific fact, each paired with a control whose code attracts the same entry.
+# The pairs are the measurement: a gain on the plants alone would not separate
+# retrieval working from a reviewer reporting whatever it was shown.
+KNOWLEDGE := know-go-defer-in-loop,know-go-clean-defer-scoped,know-go-time-after-leak,know-go-clean-timer-reset,know-go-rows-err-unchecked,know-go-clean-rows-err-checked,know-py-mutable-default,know-py-clean-none-default,know-sh-pipeline-masks-failure,know-sh-clean-pipefail,know-go-nil-map-write,know-go-clean-map-made
 
 # Every fixture in evals.InfoFixtures(): the band no reviewer had located.
 INFO := info-go-timeout-halved,info-python-pin-loosened,info-ts-any-widening,info-go-context-string-key,info-java-mutable-constant,info-sql-column-unindexed,info-bash-hardcoded-region,info-python-print-diagnostics,info-ts-magic-duration,info-go-close-error-on-write,info-clean-go-named-constant,info-clean-python-logging
@@ -242,7 +295,7 @@ eval:
 	$(if $(FIXTURES),NITPICK_EVAL_FIXTURES='$(FIXTURES)') \
 	$(if $(CAPTURE),NITPICK_EVAL_CAPTURE='$(CAPTURE)') \
 	$(if $(RELATED),NITPICK_EVAL_RELATED_CONTEXT='$(RELATED)') \
-	go test -tags=eval -count=1 -timeout=60m -v -run 'TestPrompts|TestPlanted|TestKeywords' ./internal/evals/
+	go test -tags=eval -count=1 -timeout=60m -v -run 'TestPromptsDetectPlantedDefects|TestPlanted|TestKeywords' ./internal/evals/
 
 # Compare persona variants, judged by a strong model standing in for a senior
 # human reviewer. AXIS=nitpick (default) or AXIS=voice.
@@ -255,7 +308,7 @@ tune:
 	$(if $(JUDGE2),NITPICK_EVAL_JUDGE2='$(JUDGE2)') \
 	$(if $(DUMP),NITPICK_EVAL_DUMP='$(DUMP)') \
 	$(if $(TIMEOUT),NITPICK_EVAL_TIMEOUT='$(TIMEOUT)') \
-	go test -tags=eval -count=1 -timeout=45m -v -run TestTunePersona ./internal/evals/
+	go test -tags=eval -count=1 -timeout=45m -v -run TestTunePersonaMeasuresFilterEffects ./internal/evals/
 
 # Rank every model in the battery by JUDGED quality, not keyword recall.
 .PHONY: judge-models
@@ -266,7 +319,7 @@ judge-models:
 	$(if $(JUDGE2),NITPICK_EVAL_JUDGE2='$(JUDGE2)') \
 	$(if $(DUMP),NITPICK_EVAL_DUMP='$(DUMP)') \
 	$(if $(TIMEOUT),NITPICK_EVAL_TIMEOUT='$(TIMEOUT)') \
-	go test -tags=eval -count=1 -timeout=90m -v -run TestJudgeModels ./internal/evals/
+	go test -tags=eval -count=1 -timeout=90m -v -run TestJudgeModelsScoresFixtureReviews ./internal/evals/
 
 # Head-to-head against Incumbent on identical fixtures, same judge.
 # Requires the incumbent CLI, authenticated: incumbent auth login
@@ -288,7 +341,7 @@ rejudge:
 	$(if $(REJUDGE),NITPICK_EVAL_REJUDGE_DUMP='$(REJUDGE)') \
 	$(if $(JUDGE),NITPICK_EVAL_JUDGE='$(JUDGE)') \
 	$(if $(BASELINE),NITPICK_EVAL_BASELINE_JUDGE='$(BASELINE)') \
-	go test -tags=eval -count=1 -timeout=90m -v -run TestRejudgeDump ./internal/evals/
+	go test -tags=eval -count=1 -timeout=90m -v -run TestRejudgeDumpScoresRecordedFindings ./internal/evals/
 
 # The iteration model. Cheap enough to run the whole tuning corpus for a few
 # cents, so a prompt or analyzer change can be measured before it is committed
@@ -318,8 +371,28 @@ eval-fullreview:
 # The slop corpus, judge-free, with review.slop on: recall over the plants
 # and, above all, silence on the controls.
 .PHONY: eval-slop
+# The knowledge corpus, both arms. NITPICK_EVAL_KNOWLEDGE decides which.
+.PHONY: eval-knowledge
+eval-knowledge:
+	NITPICK_EVAL_EMBED_PROVIDER=$${NITPICK_EVAL_EMBED_PROVIDER:-synthetic} \
+	NITPICK_EVAL_EMBED_MODEL=$${NITPICK_EVAL_EMBED_MODEL:-hf:nomic-ai/nomic-embed-text-v1.5} \
+	$(MAKE) benchmark-multifile FIXTURES=$(KNOWLEDGE) MODELS='$(or $(MODELS),z-ai/glm-5.3-flash)' RUNS='$(or $(RUNS),2)'
+
 eval-slop:
 	NITPICK_EVAL_SLOP=1 $(MAKE) benchmark-multifile FIXTURES='$(SLOP)' MODELS='$(or $(MODELS),z-ai/glm-5.3-flash)' RUNS='$(or $(RUNS),1)'
+
+# Security persona bake-off: ground-truth security plants under the same
+# instruction nitpick security injects. Contenders share one run (Rule 2).
+# Tuning only — do not pass SECURITY_HELD_OUT here (Rule 7).
+# DEPTH=light|deep|extreme selects the security persona prompt (default deep).
+.PHONY: eval-security
+eval-security:
+	NITPICK_EVAL_SECURITY=1 NITPICK_EVAL_SECURITY_DEPTH='$(or $(DEPTH),deep)' $(MAKE) benchmark-multifile FIXTURES='$(SECURITY)' MODELS='$(or $(MODELS),$(SECURITY_MODELS))' RUNS='$(or $(RUNS),2)'
+
+# One-shot security held-out spend. Never mix into eval-security tuning.
+.PHONY: eval-security-heldout
+eval-security-heldout:
+	NITPICK_EVAL_SECURITY=1 NITPICK_EVAL_SECURITY_DEPTH='$(or $(DEPTH),deep)' $(MAKE) benchmark-multifile FIXTURES='$(SECURITY_HELD_OUT)' MODELS='$(or $(MODELS),$(SECURITY_MODELS))' RUNS='$(or $(RUNS),2)'
 
 .PHONY: benchmark-multifile
 benchmark-multifile:

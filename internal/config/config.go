@@ -13,6 +13,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +39,16 @@ type Config struct {
 	// to publication.
 	Validation Validation `yaml:"validation"`
 
+	// Standards controls the measurement of the conventions this repository
+	// demonstrates, and `nitpick standards`.
+	Standards Standards `yaml:"standards"`
+
+	// Practices selects engineering checks and their explicit requirements.
+	Practices Practices `yaml:"practices"`
+
+	// Security configures the tree security scan (`nitpick security`).
+	Security Security `yaml:"security"`
+
 	// Source records where the configuration was loaded from. It is empty when
 	// only built-in defaults were used.
 	Source string `yaml:"-"`
@@ -57,6 +69,14 @@ type Config struct {
 	// config file is not trusted to supply them. Callers should log these: a
 	// silently ignored setting is very hard to diagnose.
 	Dropped []string `yaml:"-"`
+
+	// Unknown names keys this build does not have, which were ignored because
+	// NITPICK_IGNORE_UNKNOWN_KEYS is set. Each reads "name (line N)".
+	//
+	// Callers log these and publish them, for Dropped's reason and one more:
+	// the key was ignored on the operator's word that their binary is behind
+	// their config, and if that word was wrong the key is a typo doing nothing.
+	Unknown []string `yaml:"-"`
 
 	// User is the user-level configuration file this one was overlaid onto,
 	// empty when none applied. See internal/config/user.go.
@@ -84,8 +104,14 @@ type Config struct {
 // the SDK's provider registry, so any provider the SDK supports is usable here
 // without changes to open-nitpick.
 type ModelSpec struct {
+	// Provider names the vendor or gateway the call goes to. "nitpick
+	// providers" prints the list.
 	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
+
+	// Model is the model id as that provider spells it, which is not a name
+	// this project validates: an id the vendor does not serve fails at the
+	// call, not at load.
+	Model string `yaml:"model"`
 
 	// BaseURL points at an alternate endpoint. This is what makes local models
 	// (ollama, llama.cpp) and OpenAI-compatible gateways usable.
@@ -110,14 +136,40 @@ type ModelSpec struct {
 	// would make every character in this field a program.
 	CredentialCommand []string `yaml:"credential_command"`
 
-	Temperature *float64      `yaml:"temperature"`
-	MaxTokens   int           `yaml:"max_tokens"`
-	Timeout     time.Duration `yaml:"timeout"`
+	// Temperature is passed through unchanged. Unset leaves the role's default,
+	// which is 0 for every role here: a review that varies between runs on the
+	// same diff is one nobody can hold to a measurement.
+	Temperature *float64 `yaml:"temperature"`
+
+	// MaxTokens caps the response. Zero lets the provider decide, which is the
+	// shipped behaviour, and a cap too low truncates a finding rather than
+	// dropping it.
+	MaxTokens int `yaml:"max_tokens"`
+
+	// Timeout bounds one call, retries excluded.
+	Timeout time.Duration `yaml:"timeout"`
 
 	// StructuredOutput selects how findings are constrained to the schema:
 	// "auto" (default) prefers a JSON-Schema response format and falls back to
-	// JSON mode, "schema" forces the schema path, "json" forces JSON mode.
+	// JSON mode and then to prompt-carried text, "schema" forces the schema
+	// path, "json" forces JSON mode, "text" forces the text path, where the
+	// schema rides in the prompt and the reply is parsed leniently.
 	StructuredOutput StructuredMode `yaml:"structured_output"`
+
+	// Reasoning bounds how much a reasoning model thinks before it answers:
+	// "minimal", "low", "medium", "high", or "off" to ask for none.
+	//
+	// Unset leaves the model's own default, which is the shipped behaviour and
+	// the only setting any measurement here was taken under. A review that
+	// spent 21,423 reasoning tokens to produce 443 tokens of findings is the
+	// case this exists for, and the tradeoff is visible rather than chosen for
+	// an operator: less reasoning is faster and cheaper, and nothing here has
+	// measured what it costs in recall.
+	//
+	// Providers differ in what they can honour. One that takes a token budget
+	// gets one derived from the level, one with a boolean switch gets the
+	// switch, and one with neither ignores it.
+	Reasoning ReasoningLevel `yaml:"reasoning"`
 
 	// AllowPrivateEndpoint permits base_url to use plain HTTP or resolve to a
 	// loopback or private address.
@@ -134,7 +186,15 @@ type ModelSpec struct {
 	// runpod's endpoint_id) straight through to the SDK.
 	Extra map[string]string `yaml:"extra"`
 
-	// MaxRetries bounds SDK-level retries for transient failures.
+	// MaxRetries bounds two loops, not one, and they multiply.
+	//
+	// It is the SDK's retry count for a transient failure (a 429, a 5xx, a
+	// dropped connection) and also the local stall loop's budget for a request
+	// that returns nothing. One structured call can take several attempts
+	// through the schema, JSON and repair paths, so the ceiling on provider
+	// requests for a single extraction is the product of the three, not the
+	// largest of them. Raising this past its default of 3 raises that ceiling
+	// faster than it looks.
 	MaxRetries *int `yaml:"max_retries"`
 
 	// Fallback is the model a role escalates to when this one cannot answer:
@@ -162,6 +222,17 @@ type ModelSpec struct {
 	// OpenRouter's fifteen endpoints for it, and a pin names the one that
 	// answers.
 	Providers []string `yaml:"providers"`
+	// ServiceTier routes an OpenRouter request to a capacity grade: "default"
+	// for the standard tier, "flex" for discounted capacity that trades
+	// latency and availability for price, "priority" (alias "fast") for
+	// premium capacity at a higher rate. Empty is the provider's own default
+	// and sends no field.
+	//
+	// Flex never falls back to a standard endpoint: a capacity failure
+	// surfaces as an error, so a tier is a request, not a guarantee. A model
+	// with no flex endpoint at all routes normally at standard rates.
+	// OpenRouter only; other providers ignore it.
+	ServiceTier string `yaml:"service_tier"`
 }
 
 // StructuredMode selects a structured-output strategy.
@@ -209,6 +280,23 @@ type Models struct {
 	// ship an unmeasured capability under a measured model's name.
 	Fix *ModelSpec `yaml:"fix"`
 
+	// Security is the model the nitpick security / security_scan model pass
+	// uses. Optional: when unset, ResolveSecurity falls back to the review
+	// model (unlike Fix/Embed), because a security pass is still a review and
+	// the bake-off pins a measured winner here without forcing all PR reviews
+	// onto those weights.
+	Security *ModelSpec `yaml:"security"`
+
+	// Embed is the model that turns text into vectors for knowledge
+	// retrieval. It has no default and no fallback to Default, because an
+	// embedding model is not a chat model and naming the reviewer here would
+	// fail at the first request rather than at load.
+	//
+	// Not every provider serves embeddings, and one that does may serve a
+	// different set of models for it than it does for chat, which is why this
+	// names a provider rather than inheriting the reviewer's.
+	Embed *ModelSpec `yaml:"embed"`
+
 	// Routes choose the reviewing model per batch. The first route whose
 	// match holds wins; a batch no route matches is reviewed by the review
 	// model. Every model here overlays Default the way a role does, so a
@@ -251,9 +339,10 @@ type RouteMatch struct {
 	// of them. Naming a kind requires Models.Router.
 	Kinds []string `yaml:"kinds"`
 
-	// MinFiles and MaxFiles bound how many files the batch holds. Zero is
-	// unset.
+	// MinFiles bounds how few files the batch may hold. Zero is unset.
 	MinFiles int `yaml:"min_files"`
+
+	// MaxFiles bounds how many files the batch may hold. Zero is unset.
 	MaxFiles int `yaml:"max_files"`
 }
 
@@ -329,6 +418,18 @@ func (m Models) ResolveEnsemble(r *Route) []ModelSpec {
 	return out
 }
 
+// ResolveEmbed returns the embedding model, and false when none is named.
+//
+// Like ResolveFix and unlike ResolveModel, it does not fall back to Default.
+// Overlaying a chat model's spec would produce a configuration that looks
+// complete and fails at the first embedding request.
+func (m Models) ResolveEmbed() (ModelSpec, bool) {
+	if m.Embed == nil {
+		return ModelSpec{}, false
+	}
+	return *m.Embed, true
+}
+
 // ResolveFix returns the model that edits code, and false when none is named.
 //
 // Unlike a role, this has no fallback to the default model. A caller with no
@@ -338,6 +439,19 @@ func (m Models) ResolveFix() (ModelSpec, bool) {
 		return ModelSpec{}, false
 	}
 	return m.Default.overlay(*m.Fix), true
+}
+
+// ResolveSecurity returns the model for the security command's model pass.
+//
+// When models.security is unset it falls back to the review model (then
+// default), so an operator who has only named models.review still gets a
+// security pass. A named models.security overlays Default the way other
+// optional roles do.
+func (m Models) ResolveSecurity() ModelSpec {
+	if m.Security == nil {
+		return m.ResolveModel(RoleReview)
+	}
+	return m.Default.overlay(*m.Security)
 }
 
 // ResolveRouter returns the router spec, overlaid on Default, and whether
@@ -352,7 +466,7 @@ func (m Models) ResolveRouter() (ModelSpec, bool) {
 // Key identifies a spec for client caching: the fields that change which
 // endpoint or weights answer, and nothing that only shapes the request.
 func (s ModelSpec) Key() string {
-	return strings.Join(append([]string{s.Provider, s.Model, s.BaseURL}, s.Providers...), "|")
+	return strings.Join(append([]string{s.Provider, s.Model, s.BaseURL, s.ServiceTier, fmt.Sprint(s.Extra)}, s.Providers...), "|")
 }
 
 func intersects(a, b []string) bool {
@@ -382,7 +496,7 @@ type Review struct {
 	Concurrency int `yaml:"concurrency"`
 
 	// FailOn is the lowest severity that makes the run exit non-zero.
-	// "none" never fails the run.
+	// "none" disables this finding threshold, not required stages or practice policy.
 	FailOn Severity `yaml:"fail_on"`
 
 	// MinSeverity drops findings below this severity before publishing.
@@ -441,6 +555,85 @@ type Review struct {
 	// separate switch, and off unless asked for. It does nothing unless
 	// RelatedContext is on.
 	RelatedContextCallers bool `yaml:"related_context_callers"`
+
+	// RelatedContextPreamble replaces the sentence bundle.Render writes above
+	// every attached definition. The shipped sentence says the context is
+	// reference only and is not under review, which is the right default for
+	// a model that treats additional code as more surface to comment on, and
+	// the wrong one for a model that reads the same context as license to
+	// override a finding the diff alone justified. Tuning the phrasing is
+	// how the second behaviour is measured against the first.
+	//
+	// Empty keeps the shipped sentence.
+	RelatedContextPreamble string `yaml:"related_context_preamble"`
+
+	// RelatedContextRerank sorts attached definitions by how much of their
+	// snippet overlaps the change's added text, and drops ones whose only
+	// overlap is the name that already selected them. The default orders by
+	// use count, which attaches a frequently-named helper even when its body
+	// has nothing in common with the change. Off until a measurement says
+	// otherwise; see docs/experiment-context-framing.md.
+	RelatedContextRerank bool `yaml:"related_context_rerank"`
+
+	// Knowledge attaches entries from the shipped corpus that the change
+	// resembles: antipatterns and standard-library contracts a model may not
+	// carry. It needs models.embed, and does nothing without it.
+	//
+	// Off by default, and it should stay off until a measurement says
+	// otherwise. Reference material beside a diff is a reason for a model to
+	// report the reference, and a reviewer that invents defects out of a style
+	// guide is worse than one that misses them.
+	Knowledge bool `yaml:"knowledge"`
+
+	// Standards hands the reviewer the conventions this repository was measured
+	// to follow, counted at the base revision.
+	//
+	// The same shape as Knowledge and the same caution, with one difference
+	// that matters: an entry under knowledge is a claim about a language, and a
+	// rule here is a claim about this tree, so a reader who doubts it can
+	// recount it. That is why the share is rendered beside every rule rather
+	// than the rule alone.
+	//
+	// Off by default. Reference material beside a diff is a reason for a model
+	// to report the reference, and a reviewer that turns a house convention
+	// into a defect on every departure is worse than one that never heard of
+	// it. It needs a local checkout and a base revision; without either the run
+	// says so rather than measuring something else.
+	Standards bool `yaml:"standards"`
+
+	// KnowledgeQuery is what gets embedded to retrieve against: "batch", the
+	// changed lines of the whole batch as one query, or "file", one query per
+	// changed file whose results are merged.
+	//
+	// Batch is what shipped and what was measured. File costs one embedding
+	// call per file and exists because a small relevant defect in one file is
+	// buried when a large change in another dominates the query, which is a
+	// failure the corpus's own fixtures are too small to show.
+	KnowledgeQuery string `yaml:"knowledge_query"`
+
+	// KnowledgeMinScore drops retrieved entries below this cosine, so a change
+	// resembling nothing in the corpus gets nothing rather than its five least
+	// distant entries. Zero is off, which is what shipped.
+	KnowledgeMinScore float64 `yaml:"knowledge_min_score"`
+
+	// KnowledgeTokens bounds the retrieved section, counted with its own
+	// framing. Zero is unbounded, which is what shipped: the section carries
+	// at most five entries and the ceiling below is what a measurement would
+	// tighten.
+	//
+	// Spent from the request budget like related context, so a large value
+	// narrows the window the changed files get.
+	KnowledgeTokens int `yaml:"knowledge_tokens"`
+
+	// KnowledgeIndex names an index file to retrieve from, instead of the one
+	// this build ships for the configured embedding model.
+	//
+	// The escape hatch that keeps the embedding model configuration rather
+	// than a property of the binary: an operator whose provider is not one of
+	// the shipped ones runs `nitpick knowledge-index` and names the result
+	// here. It is checked against the corpus and the model like any other, so
+	// naming a file buys no exemption from either.
+	KnowledgeIndex string `yaml:"knowledge_index"`
 
 	// ModelNotes adds the prompt layer addressed to the reviewing model's
 	// family (prompt.ModelGuidance). On unless set to false; the switch
@@ -518,11 +711,48 @@ type Approve struct {
 	RequireAnalyzers bool `yaml:"require_analyzers"`
 }
 
+// Standards controls how conventions are measured and how much evidence one
+// needs before it is written down as a rule.
+//
+// The probes themselves are compiled in, so nothing here can add one. A
+// measurement whose instrument arrived with the thing being measured is not a
+// measurement, and a repository able to define its own probe could define one
+// that passes.
+type Standards struct {
+	// MinShare is the conforming fraction a probe needs before its rule is
+	// written down. Zero means the built-in floor.
+	//
+	// A repository midway through adopting a convention wants to watch the
+	// number climb without the rule being asserted yet; one that has finished
+	// wants a higher bar than the default. Both are the same knob.
+	MinShare float64 `yaml:"min_share"`
+
+	// MinSites is how many places a probe must have an opinion about before a
+	// share means anything. Zero means the built-in floor.
+	//
+	// A share alone lies at small counts: three out of three is 100% and is
+	// evidence of nothing.
+	MinSites int `yaml:"min_sites"`
+
+	// Disabled are probe IDs to skip. A disabled probe is absent from the
+	// report rather than present at zero, so switching one off cannot be
+	// mistaken for a repository that fails it.
+	Disabled []string `yaml:"disabled"`
+}
+
 // Instruction is a path-scoped prompt addition. Every instruction whose Path
 // glob matches a file is appended to that file's review prompt, so instructions
 // compose rather than override one another.
 type Instruction struct {
-	Path   string `yaml:"path"`
+	// Path is a glob matched against each changed file's repository-relative
+	// path, in the doublestar dialect, so "**/*.go" reaches every directory.
+	Path string `yaml:"path"`
+
+	// Prompt is appended to the review prompt for a matching file.
+	//
+	// It is repository text and goes through bundle.PromptSafe, so it cannot
+	// open a line of its own and cannot draw a heading. It is not inside a
+	// fence marker.
 	Prompt string `yaml:"prompt"`
 }
 
@@ -586,12 +816,22 @@ type Linters struct {
 	// arbitrary JavaScript that eslint loads and EXECUTES with the review's
 	// credentials in the environment.
 	//
-	// These keys are not scrubbed by Config.sanitize, unlike base_url and
-	// persona.custom. Those name a network endpoint or free text that reaches a
-	// model, both of which a change can supply outright. A value here can only
-	// name a file the change cannot write, because internal/linters refuses any
-	// configuration that resolves inside the repository, so the worst a merged
-	// value does is point at a file the operator's own environment already has.
+	// The path keys here are not pruned, unlike base_url and persona.custom.
+	// Those name a network endpoint or free text that reaches a model, both of
+	// which a change can supply outright. A path here can only name a file the
+	// change cannot write, because internal/linters refuses any configuration
+	// that resolves inside the repository, so the worst a merged value does is
+	// point at a file the operator's own environment already has.
+	//
+	// That argument covers the paths and nothing else, which is why two keys
+	// it used to cover are pruned now: linters.trusted names no file at all,
+	// and a semgrep_config registry reference is a network fetch rather than a
+	// path. See untrustedElsewhere in trust.go.
+	//
+	// What stands behind the rest is not this comment but the base-revision
+	// substitution: a change that edits .nitpick.yaml is reviewed under the
+	// version already accepted, so a pull request cannot supply the analyzer
+	// settings it is reviewed under. See internal/config/policy.go.
 
 	// GolangciConfig is an absolute path to a .golangci.yml outside the
 	// repository. Empty runs golangci-lint under open-nitpick's own config,
@@ -632,9 +872,12 @@ type Linters struct {
 	// its own isolation flag, or not at all; `nitpick linters` says which.
 	Configs map[string]string `yaml:"configs"`
 
-	// AutoDetect runs every catalog analyzer that is installed, isolated from
-	// the tree, and executes nothing from it, whenever the change contains
-	// files it reads, without each being named in Enabled. One that is not
+	// AutoDetect runs the catalog analyzers marked auto, each installed,
+	// isolated from the tree, and executing nothing from it, whenever the
+	// change contains files it reads and without being named in Enabled;
+	// `nitpick linters` says which those are. It is not every catalog
+	// analyzer: the ones marked opt-in there are reached by naming and by
+	// nothing else, so this key never turns them on. One that is not
 	// installed is skipped, silently in auto mode and in strict mode alike:
 	// strict is a promise about the analyzers an operator NAMED, and naming
 	// one here is how to make its absence fail the run. Defaults to on.
@@ -646,6 +889,11 @@ type Linters struct {
 	// refused by default. Name one here only where every change reviewed
 	// comes from people who could already run code in this CI job.
 	Trusted []string `yaml:"trusted"`
+
+	// ForceGosec asks golangci-lint to enable gosec for this run. Set only by
+	// the security command; it is not a YAML key, so a repository cannot opt
+	// into or out of the overlay through .nitpick.yaml.
+	ForceGosec bool `yaml:"-"`
 }
 
 // AutoDetects reports whether catalog analyzers run without being named.
@@ -732,11 +980,18 @@ func loadBytes(data []byte, source string) (*Config, error) {
 	//
 	// This runs before applyEnv so the environment can still supply what
 	// neither file said.
-	dropped, userKeys, overridden, err := cfg.overlay(userData, data, trustEndpointKeys(nil))
+	dropped, userKeys, overridden, unknown, err := cfg.overlay(userData, data, trustEndpointKeys(nil), userPath, source)
 	if err != nil {
+		// overlay has already built the keys-from-a-newer-nitpick message,
+		// because only it knows which of the two documents carried them.
+		var built worded
+		if errors.As(err, &built) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("parse config %s: %w", source, err)
 	}
 	cfg.Dropped = dropped
+	cfg.Unknown = unknown
 	cfg.User, cfg.UserKeys, cfg.UserOverridden = userPath, userKeys, overridden
 
 	cfg.applyEnv(nil)
@@ -769,9 +1024,14 @@ func defaultConfig() (*Config, error) {
 		return nil, err
 	}
 	if len(userData) > 0 {
-		if err := cfg.merge(userData); err != nil {
+		ignored, err := cfg.merge(userData, ignoreUnknownKeys(nil))
+		if err != nil {
+			if keys, only := unknownFields(err); only {
+				return nil, unknownKeyError(userPath, keys)
+			}
 			return nil, fmt.Errorf("parse user config %s: %w", userPath, err)
 		}
+		cfg.Unknown = append(cfg.Unknown, render(ignored, userPath, false)...)
 		node, _ := documentNode(userData)
 		cfg.User, cfg.UserKeys = userPath, keyPaths(node)
 	}
@@ -790,18 +1050,133 @@ func defaultConfig() (*Config, error) {
 // the document replace the default; fields absent from the document keep their
 // default value. Sequences replace wholesale rather than appending, so a
 // repository can narrow the default ignore list rather than only widening it.
-func (c *Config) merge(data []byte) error {
+func (c *Config) merge(data []byte, tolerate bool) ([]unknownKey, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 
-	if err := dec.Decode(c); err != nil {
-		// An empty document yields io.EOF and leaves defaults in place.
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		return err
+	err := dec.Decode(c)
+	switch {
+	case err == nil:
+		return nil, nil
+	// An empty document yields io.EOF and leaves defaults in place.
+	case errors.Is(err, io.EOF):
+		return nil, nil
 	}
-	return nil
+
+	unknown, only := unknownFields(err)
+	if !only || !tolerate {
+		return nil, err
+	}
+	// Everything the document did set is already applied: yaml.v3 records an
+	// unknown field and carries on, which is what makes ignoring one a matter
+	// of keeping this config rather than decoding it again.
+	return unknown, nil
+}
+
+// unknownFields reads a decode failure as a list of keys this build does not
+// have, and says whether that is all it was.
+//
+// only is false for a failure with anything else in it, a type error among the
+// unknown keys included. Such a decode applied some of the document and skipped
+// some, and nothing here knows which, so the caller refuses the file rather
+// than reviewing under a config it cannot describe.
+func unknownFields(err error) (keys []unknownKey, only bool) {
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) || len(typeErr.Errors) == 0 {
+		return nil, false
+	}
+
+	for _, e := range typeErr.Errors {
+		m := unknownField.FindStringSubmatch(e)
+		if m == nil {
+			return nil, false
+		}
+		line, err := strconv.Atoi(m[1])
+		if err != nil {
+			return nil, false
+		}
+		keys = append(keys, unknownKey{Name: m[2], Line: line})
+	}
+	return keys, true
+}
+
+// unknownKey is a key this build does not have, and where it was.
+//
+// The parts are carried rather than a formatted string, because a key can
+// contain anything a yaml key can, the words "(line 4)" included. Round-
+// tripping through a rendered string let such a key be re-parsed as its own
+// location and published pointing at a line it is not on, which is the wrong
+// number withoutLines refuses to print.
+type unknownKey struct {
+	Name string
+	Line int
+
+	// File is the document's base name, empty until a caller that knows which
+	// of the two it read fills it in.
+	File string
+}
+
+// String renders one key for a reader, with the file when there is one and the
+// line when it can be trusted.
+func (k unknownKey) String() string {
+	switch {
+	case k.File == "" && k.Line == 0:
+		return k.Name
+	case k.File == "":
+		return fmt.Sprintf("%s (line %d)", k.Name, k.Line)
+	case k.Line == 0:
+		return fmt.Sprintf("%s (%s)", k.Name, k.File)
+	default:
+		return fmt.Sprintf("%s (%s line %d)", k.Name, k.File, k.Line)
+	}
+}
+
+// unknownField matches the one message yaml.v3 writes for a KnownFields
+// violation, formatted at gopkg.in/yaml.v3@v3.0.1/decode.go:944.
+// TestTheUnknownFieldMessageIsStillYAMLsOwn fails when that wording changes,
+// which would otherwise turn every ignored key fatal again with nothing said.
+// The key is `.+?` rather than `\S+`: a yaml key may contain a space, and
+// failing to match one would send it back to yaml's own Go-type message, which
+// is the message this exists to replace.
+var unknownField = regexp.MustCompile(`^line (\d+): field (.+?) not found in type .+$`)
+
+// Version is the nitpick that is running, for messages that turn on it. Set by
+// package main, whose linker sets it; empty when nobody said.
+var Version string
+
+// unknownKeyError is the fatal message for keys this build does not have.
+//
+// Built rather than wrapping yaml's, because yaml's names a Go type and no
+// remedy: "field fix not found in type config.Models" is an answer for someone
+// reading this source, and the person who hit it copied a key out of the
+// documentation.
+func unknownKeyError(source string, keys []unknownKey) error {
+	return worded{text: unknownKeyText(source, keys)}
+}
+
+// worded is a message that already names the file it is about, typed so a
+// caller can tell it from a parse failure it should label. The file is not
+// always the caller's: the user-level document fails inside a load that knows
+// only the repository's path.
+type worded struct{ text string }
+
+func (e worded) Error() string { return e.text }
+
+// unknownKeyText writes the message.
+func unknownKeyText(source string, keys []unknownKey) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s has keys this nitpick does not know:\n\n", source)
+	for _, k := range keys {
+		// Without the file, which the sentence above already named.
+		fmt.Fprintf(&b, "  %s\n", unknownKey{Name: k.Name, Line: k.Line})
+	}
+	b.WriteString("\n")
+	if Version != "" {
+		fmt.Fprintf(&b, "This is nitpick %s. ", Version)
+	}
+	fmt.Fprintf(&b, "A key added after this version is rejected the same way a "+
+		"typo is. Set %s=1 to ignore them and continue.", EnvIgnoreUnknownKeys)
+	return b.String()
 }
 
 // ModelNotesOn reports whether the model-family prompt layer is in force.
@@ -861,8 +1236,8 @@ const (
 )
 
 // overlay returns base with every field the override sets replaced.
-func (base ModelSpec) overlay(over ModelSpec) ModelSpec {
-	out := base
+func (s ModelSpec) overlay(over ModelSpec) ModelSpec {
+	out := s
 	if over.Provider != "" {
 		out.Provider = over.Provider
 	}
@@ -877,7 +1252,7 @@ func (base ModelSpec) overlay(over ModelSpec) ModelSpec {
 	switch {
 	case over.Providers != nil:
 		out.Providers = append([]string(nil), over.Providers...)
-	case over.Model != "" && over.Model != base.Model:
+	case over.Model != "" && over.Model != s.Model:
 		out.Providers = nil
 	}
 	if over.BaseURL != "" {
@@ -905,6 +1280,12 @@ func (base ModelSpec) overlay(over ModelSpec) ModelSpec {
 	if over.StructuredOutput != "" {
 		out.StructuredOutput = over.StructuredOutput
 	}
+	if over.Reasoning != "" {
+		out.Reasoning = over.Reasoning
+	}
+	if over.ServiceTier != "" {
+		out.ServiceTier = over.ServiceTier
+	}
 	if over.MaxRetries != nil {
 		out.MaxRetries = over.MaxRetries
 	}
@@ -912,8 +1293,8 @@ func (base ModelSpec) overlay(over ModelSpec) ModelSpec {
 		out.AllowPrivateEndpoint = true
 	}
 	if len(over.Extra) > 0 {
-		out.Extra = make(map[string]string, len(base.Extra)+len(over.Extra))
-		maps.Copy(out.Extra, base.Extra)
+		out.Extra = make(map[string]string, len(s.Extra)+len(over.Extra))
+		maps.Copy(out.Extra, s.Extra)
 		maps.Copy(out.Extra, over.Extra)
 	}
 	return out
@@ -940,3 +1321,27 @@ func (c *Config) Ignored(path string) bool {
 	}
 	return false
 }
+
+// ReasoningLevel is how much a reasoning model is asked to think.
+type ReasoningLevel string
+
+// The levels, and the one that asks for no reasoning at all.
+const (
+	ReasoningMinimal ReasoningLevel = "minimal"
+	ReasoningLow     ReasoningLevel = "low"
+	ReasoningMedium  ReasoningLevel = "medium"
+	ReasoningHigh    ReasoningLevel = "high"
+	ReasoningOff     ReasoningLevel = "off"
+)
+
+// ReasoningLevels reports what models.*.reasoning accepts, for the generated
+// reference and the validator.
+func ReasoningLevels() []string {
+	return []string{
+		string(ReasoningMinimal), string(ReasoningLow), string(ReasoningMedium),
+		string(ReasoningHigh), string(ReasoningOff),
+	}
+}
+
+// ReasoningValues reports the same, for the generated reference.
+func (s ModelSpec) ReasoningValues() []string { return ReasoningLevels() }

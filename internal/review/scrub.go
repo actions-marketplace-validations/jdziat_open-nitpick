@@ -16,8 +16,9 @@ import (
 var (
 	// An em dash, or an en dash between spaces, standing in for a comma.
 	dashSeparator = regexp.MustCompile(`\s*[—]\s*|\s+–\s+`)
-	// Filler that says nothing, with its leading space.
-	fillerWord = regexp.MustCompile(`(?i)\s*\b(genuinely|honestly|actually|truly|simply|crucially|importantly|very|quite|somewhat)\b`)
+	// Filler that says nothing. The optional leading comma is captured so
+	// "slow, actually fragile" becomes "slow, fragile" rather than "slow,fragile".
+	fillerWord = regexp.MustCompile(`(?i)(,?)\s*\b(genuinely|honestly|actually|truly|simply|crucially|importantly|very|quite|somewhat)\b`)
 	fillerLead = regexp.MustCompile(`(?i)^\s*(it'?s worth noting( that)?|note that|it should be noted( that)?)[,:]?\s*`)
 	// The chat wrapper: an opener at the start, an offer at the end.
 	chatOpen  = regexp.MustCompile(`(?i)^\s*(sure[!,.]?|certainly[!,.]?|great question[!.]?|of course[!,.]?|here'?s (the|a|an|your)\s+\w+[:.]?)\s*`)
@@ -46,7 +47,7 @@ func Scrub(s string) (string, bool) {
 		text = chatClose.ReplaceAllString(text, "")
 		text = dashSeparator.ReplaceAllString(text, ", ")
 		text = proseArrow.ReplaceAllString(text, " to ")
-		text = fillerWord.ReplaceAllString(text, "")
+		text = fillerWord.ReplaceAllString(text, "$1")
 		text = spaceRun.ReplaceAllString(text, " ")
 		text = spaceStop.ReplaceAllString(text, "$1")
 		return text
@@ -134,6 +135,13 @@ func scrubFindings(findings []Finding) int {
 		}
 		if r, changed := Scrub(findings[i].Rationale); changed {
 			findings[i].Rationale, n = r, n+1
+		}
+		// The expert's stated doubt is published prose of the same provenance
+		// as the two above, and scrubOverruled already cleans the expert's
+		// reason for a finding it removed. A finding this tool publishes must
+		// not carry the habits it reports in other people's code.
+		if u, changed := Scrub(findings[i].Unresolved); changed {
+			findings[i].Unresolved, n = u, n+1
 		}
 	}
 	return n

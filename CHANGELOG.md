@@ -1,5 +1,107 @@
 # Changelog
 
+## [2.2.0](https://github.com/jdziat/open-nitpick/compare/v2.1.0...v2.2.0) (2026-09-19)
+
+
+### Features
+
+* assess engineering practices with explicit coverage ([#114](https://github.com/jdziat/open-nitpick/issues/114)) ([cd63852](https://github.com/jdziat/open-nitpick/commit/cd638524a2194375798b2519f9d24f1cfce9dc35))
+* evaluate and enforce repository standards ([4f36b0c](https://github.com/jdziat/open-nitpick/commit/4f36b0c3a9c530cebd89a4967ac4705e8a8bf6c7))
+* evaluate repository standards with linter enforcement ([2f6b861](https://github.com/jdziat/open-nitpick/commit/2f6b8612cd2662d7a6829f12786296feb3af6f5b))
+* measure Python JavaScript Java and Ruby standards ([6c14794](https://github.com/jdziat/open-nitpick/commit/6c1479426b765927e377804faf1d20f3c402fa44))
+* measure standards in Python JavaScript Java and Ruby ([b3f0420](https://github.com/jdziat/open-nitpick/commit/b3f04206d94cbe7e2269d7727b44996eee4c6d31))
+* plan and bind package design review tasks ([47b39d4](https://github.com/jdziat/open-nitpick/commit/47b39d4b04c82a3c5ca14363bd266af06a7651cf))
+* **security:** add tree scan command and hard eval corpus ([#134](https://github.com/jdziat/open-nitpick/issues/134)) ([1590d42](https://github.com/jdziat/open-nitpick/commit/1590d422c7ca9e40f334b147c87acf2d00240633))
+
+
+### Fixes
+
+* distinguish Ruby appends from heredoc openers ([8eaa316](https://github.com/jdziat/open-nitpick/commit/8eaa3163c4c18b73db6e8804f399ce2b9773035f))
+* empty length-cap retries, context framing, and laguna full-review notes ([#133](https://github.com/jdziat/open-nitpick/issues/133)) ([7d01a6e](https://github.com/jdziat/open-nitpick/commit/7d01a6ebc4237015ca09355077c44b9695390820))
+* enforce pull request squash titles ([#116](https://github.com/jdziat/open-nitpick/issues/116)) ([05aa782](https://github.com/jdziat/open-nitpick/commit/05aa78270862f2175fdc66e1a286b56c4efdf472))
+* harden engineering profile checks ([#122](https://github.com/jdziat/open-nitpick/issues/122)) ([53f451f](https://github.com/jdziat/open-nitpick/commit/53f451fd8904b8536e567d4c013f8e23f4d8b228))
+* preserve coverage across intentional exclusions ([43eb94d](https://github.com/jdziat/open-nitpick/commit/43eb94dcfdcc9a07f42f622351c632ae6ce55a79))
+* preserve GitHub content lookup failures ([#117](https://github.com/jdziat/open-nitpick/issues/117)) ([6cf7fda](https://github.com/jdziat/open-nitpick/commit/6cf7fda713ab5326ae97a4009e38f8e3e0e03e22))
+* preserve review integrity across retries ([333cd6e](https://github.com/jdziat/open-nitpick/commit/333cd6ee3ce9e8512619773adea7698108709161))
+* preserve review integrity across retries and publication ([ed1d676](https://github.com/jdziat/open-nitpick/commit/ed1d676500ead9a5a92b5c2b266b1fcec8f46dea))
+* **security:** address PR [#134](https://github.com/jdziat/open-nitpick/issues/134) review findings ([#135](https://github.com/jdziat/open-nitpick/issues/135)) ([ee87717](https://github.com/jdziat/open-nitpick/commit/ee8771724d41bf12669fa522c5aceede1017bad2))
+* stop rechecking confirmed resolved threads ([2a340a0](https://github.com/jdziat/open-nitpick/commit/2a340a02c941b78cabc59a2ec7ceafb88e8ec08c))
+
+## [2.1.0](https://github.com/jdziat/open-nitpick/compare/v2.0.1...v2.1.0) (2026-09-11)
+
+
+### Features
+
+* **review:** hand the reviewer what this repository was measured to do ([#104](https://github.com/jdziat/open-nitpick/issues/104)) ([641dc47](https://github.com/jdziat/open-nitpick/commit/641dc4777c494cfb15da8d30c5c5b2d71edfccb0))
+* **review:** NewEngine names the wiring a review cannot do without ([#107](https://github.com/jdziat/open-nitpick/issues/107)) ([9bfa4b5](https://github.com/jdziat/open-nitpick/commit/9bfa4b5d82ae64d8abe26aa3f97d195fd38655f7))
+* **standards:** measure conformity from the analyzers ([#106](https://github.com/jdziat/open-nitpick/issues/106)) ([ce581c3](https://github.com/jdziat/open-nitpick/commit/ce581c3f77ac71b94f459acb5f9a1f38b4994667))
+* **standards:** measure repo conventions and generate AGENTS.md ([#103](https://github.com/jdziat/open-nitpick/issues/103)) ([64e82a1](https://github.com/jdziat/open-nitpick/commit/64e82a1aa2f0ae2342173aaa339f55908d7772a5))
+
+
+### Fixes
+
+* **respond:** a change may not supply the policy it is answered under ([#99](https://github.com/jdziat/open-nitpick/issues/99)) ([e9bd59f](https://github.com/jdziat/open-nitpick/commit/e9bd59fe42b74ed123e588c327ab433be68369c6))
+* **review:** catch bugs introduced by removal-only edits ([#98](https://github.com/jdziat/open-nitpick/issues/98)) ([9aab6da](https://github.com/jdziat/open-nitpick/commit/9aab6dad72f820ba9e4a871ba32abe2bb58b7508))
+
+## [2.0.1](https://github.com/jdziat/open-nitpick/compare/v1.12.0...v2.0.1) (2026-09-09)
+
+Same tree as the 2.0.0 release commit. The v2.0.0 tag was created and removed
+before its release ran, and tag immutability is on, so the name cannot be
+reused. The breaking changes below are 2.0.0's and land here instead.
+
+## [2.0.0](https://github.com/jdziat/open-nitpick/compare/v1.12.0...v2.0.0) (2026-09-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **fence:** linters.trusted and review.knowledge_index are ignored when they come from a repository's own .nitpick.yaml. Neither names a file, which is the argument the rest of the linters block relies on: linters.trusted is the only gate on the analyzers that run the tree's own code, and knowledge_index is a path this process opens. Move either to the user-level file, which on a runner is named with NITPICK_USER_CONFIG, or set NITPICK_TRUST_CONFIG_ENDPOINTS=1. Both are named in the log, in explain-config and on the pull request.
+
+### Features
+
+* **config:** an opt-in for keys a newer nitpick added ([#94](https://github.com/jdziat/open-nitpick/issues/94)) ([ffbad30](https://github.com/jdziat/open-nitpick/commit/ffbad3083bb9ae180c80a3843e69dd51ac7d8a70))
+* **review:** findings carry what the reviewer read, and version-gated entries ([#91](https://github.com/jdziat/open-nitpick/issues/91)) ([1d1b2ba](https://github.com/jdziat/open-nitpick/commit/1d1b2ba2172dd496f59dfab50b9dea210e28d3df))
+
+
+### Fixes
+
+* **fence:** one marker vocabulary, and a marker per request where it is written back ([#96](https://github.com/jdziat/open-nitpick/issues/96)) ([7c643c6](https://github.com/jdziat/open-nitpick/commit/7c643c6d475c0ae8adbf01418e70df8fa9b2ca08))
+* **review:** triage answers by number, so a finding keeps its metadata ([#97](https://github.com/jdziat/open-nitpick/issues/97)) ([74c1e9b](https://github.com/jdziat/open-nitpick/commit/74c1e9b2e338e05d6876895bcae740844e546bea))
+
+## [1.12.0](https://github.com/jdziat/open-nitpick/compare/v1.11.2...v1.12.0) (2026-09-09)
+
+
+### Features
+
+* **knowledge:** retrieval across every command, selectable bundles, class routing and a pre-registered evaluation ([#85](https://github.com/jdziat/open-nitpick/issues/85)) ([ffcc840](https://github.com/jdziat/open-nitpick/commit/ffcc8405f767f313812659e851ef4fd9fc6cf322)), closes [#84](https://github.com/jdziat/open-nitpick/issues/84)
+* **knowledge:** retrieve what the model was not taught ([#80](https://github.com/jdziat/open-nitpick/issues/80)) ([5709a07](https://github.com/jdziat/open-nitpick/commit/5709a075bb1c83e11bf223e8d8fda85410867971))
+* **knowledge:** ship voyage-code-4 and qwen3-embedding-8b bundles ([#89](https://github.com/jdziat/open-nitpick/issues/89)) ([2bb8c9b](https://github.com/jdziat/open-nitpick/commit/2bb8c9ba5e4e4dabb326a7622d3756f938371a92))
+
+
+### Fixes
+
+* **bundle,llm:** stop sending an added file twice, and say when a call is slow ([#86](https://github.com/jdziat/open-nitpick/issues/86)) ([a5a4290](https://github.com/jdziat/open-nitpick/commit/a5a4290cf5d789b1107e1de531e95db148bfb132))
+* **knowledge:** check the embedding model at query time, not only at build ([#90](https://github.com/jdziat/open-nitpick/issues/90)) ([7bbd023](https://github.com/jdziat/open-nitpick/commit/7bbd023fe6f22e779b15cdcbfe58cf23da86f86b))
+* **review,bundle:** reasoning budget, concurrent style pass, framing-aware budget ([#87](https://github.com/jdziat/open-nitpick/issues/87)) ([0120e85](https://github.com/jdziat/open-nitpick/commit/0120e85052b55f8c08e8870084ad1c8ca9880814))
+
+
+### Measurement
+
+* **knowledge:** freeze the 100-snapshot selection ([#88](https://github.com/jdziat/open-nitpick/issues/88)) ([6dd5872](https://github.com/jdziat/open-nitpick/commit/6dd5872ab5e2f2ea92f2af2cf29c525d1dd7cb73)), closes [#84](https://github.com/jdziat/open-nitpick/issues/84)
+
+## [1.11.2](https://github.com/jdziat/open-nitpick/compare/v1.11.1...v1.11.2) (2026-09-08)
+
+
+### Fixes
+
+* **review:** a failed stage stops reporting the run as clean ([#78](https://github.com/jdziat/open-nitpick/issues/78)) ([5d442e0](https://github.com/jdziat/open-nitpick/commit/5d442e0751c1aa9ba7c1352c590681b0c70475a6))
+
+## [1.11.1](https://github.com/jdziat/open-nitpick/compare/v1.11.0...v1.11.1) (2026-09-08)
+
+
+### Documentation
+
+* generate the configuration reference, and fix what the site got wrong ([#75](https://github.com/jdziat/open-nitpick/issues/75)) ([cf7a41f](https://github.com/jdziat/open-nitpick/commit/cf7a41f6b4d16b74312f5c5a70fb09fecd12ec42))
+
 ## [1.11.0](https://github.com/jdziat/open-nitpick/compare/v1.10.0...v1.11.0) (2026-09-08)
 
 

@@ -4,9 +4,11 @@ Everything is optional: with no config file at all, `LLM_PROVIDER` and
 `LLM_MODEL` are enough to run. `.nitpick.yaml` at the repository root:
 
 `nitpick init` writes one of these for you, commented, with the analyzers this
-checkout's languages call for. The reference below is what to reach for when
-changing a key it left at its default. `nitpick explain-config` prints what any
-of it resolves to without spending a token.
+checkout's languages call for. This page argues the settings worth changing;
+[Configuration reference](configuration-reference.md) lists every key the
+loader accepts, with its type and its shipped default, generated from the
+binary. `nitpick explain-config` prints what any of it resolves to without
+spending a token.
 
 ## Two files
 
@@ -22,11 +24,12 @@ the environment for what neither said, then flags. It takes the same keys in the
 same shape.
 
 It is also the only file trusted with `base_url`, `api_key_env`, `extra`,
-`allow_private_endpoint` and `persona.custom`, and it needs no
-`NITPICK_TRUST_CONFIG_ENDPOINTS` to use them: you wrote it, and it sits outside
-every checkout where no pull request can reach it. A repository that names any
-of those keys still has them dropped, and `nitpick explain-config` names both
-the file and what it supplied. See [Trust model](trust-model.md).
+`allow_private_endpoint`, `api_key_keyring`, `credential_command` and
+`persona.custom`, and it needs no `NITPICK_TRUST_CONFIG_ENDPOINTS` to use
+them: you wrote it, and it sits outside every checkout where no pull request
+can reach it. A repository that names any of those keys still has them
+dropped, for every model role, and `nitpick explain-config` names both the
+file and what it supplied. See [Trust model](trust-model.md).
 
 It is **not read on a runner**, where `CI` or `GITHUB_ACTIONS` is set, because
 nobody there wrote it. `NITPICK_USER_CONFIG=/path/to/config.yaml` names one
@@ -136,6 +139,12 @@ repository scores a reviewer on recall and noise, and neither says whether a
 model can produce a change that compiles, so falling back to `models.default`
 would ship an unmeasured capability under a measured model's name. Without
 `models.fix` the command refuses and says why.
+
+`models.security` is the optional model for `nitpick security` / `security_scan`.
+When unset, the security model pass falls back to `models.review` (then
+`models.default`). Unlike `models.fix`, that fallback is deliberate: a security
+pass is still a review, and the bake-off in `docs/findings.md` pins a measured
+winner here without forcing every PR review onto those weights.
 
 **Nothing is compiled, run, tested, formatted or linted before the pull request
 opens.** There is no checkout: the change is written through the forge's data
@@ -294,6 +303,8 @@ review:
   incremental: true                # on a re-run, read only what changed since the last review
   related_context: true            # default: attach imported definitions used on changed lines (see below)
   related_context_callers: false   # default: also walk the repository for callers of what the change redefines
+  related_context_preamble: ""     # default: the shipped "Context only" sentence; replace to tune how a model treats attached context
+  related_context_rerank: false    # default: order by use count; set true to prefer definitions whose body overlaps the change
   slop: false                      # default: also report the slop class (see "The slop class" below)
   max_files: 60
   token_budget_per_request: 60000  # per model CALL; raise it for large-context models
@@ -371,7 +382,7 @@ caller passes comes along with it. The walk is up to 150 file fetches a
 review on top of the changed files, and when that ceiling stops it short the
 summary says so, so a file with no callers attached is not read as a file
 with no callers. Measured on its own corpus in
-[docs/findings.md](findings.md#callers-2026-09-05): a cheap model went
+[Findings](findings.md#callers-2026-09-05): a cheap model went
 from finding none of the planted contract breaks to seven of eight.
 
 It is bounded by `review.related_context_tokens` per batch, spent only from
@@ -387,10 +398,163 @@ sweep was measured with them on; that direction ships on. The caller walk
 reads up to 150 files the change never named and sends excerpts to the model,
 which is a different consent boundary from "review my diff", so it ships off
 and the measured gain (0/8 to 7/8 on its corpus, noise down on the multi-file
-corpus, in [docs/findings.md](findings.md#callers-2026-09-05)) is for
+corpus, in [Findings](findings.md#callers-2026-09-05)) is for
 the operator to weigh against that. Context is not free either way: the same
 definitions that let a model confirm a defect give it more to be confidently
 wrong about.
+
+## Knowledge the model may not carry
+
+Related context above retrieves code from this repository. This retrieves prose
+from a corpus that ships with the binary: antipatterns and standard-library
+contracts a reviewing model covers unevenly, attached to a batch when the
+change resembles one.
+
+```yaml
+models:
+  embed:
+    provider: synthetic
+    model: hf:nomic-ai/nomic-embed-text-v1.5
+
+review:
+  knowledge: true
+```
+
+`models.embed` has no default and does not fall back to `models.default`: an
+embedding model is not a chat model, and overlaying one produces a
+configuration that looks complete and fails at the first request. A provider
+that serves chat may serve a different set of models for embeddings, so this
+names its own provider. Synthetic includes embeddings in the subscription at no
+additional charge, which is why the example uses it.
+
+The corpus is fourteen entries under `internal/knowledge/corpus`, each naming
+the source it came from, the day that source was read, the languages it applies
+to and the review classes it is about. The classes route it: the defect pass
+sees correctness, concurrency, security, resource, data-loss, contract and
+tests entries, `improve`'s style pass sees style entries, maintainability goes
+to both, and slop entries arrive only when `review.slop` is on. A style rule in
+front of the defect reviewer is the same dilution the generation scope exists
+to prevent, arriving as reference material instead of as a prompt.
+
+An entry applies to the languages it names. `languages: [any]` is the only way
+to write one that crosses them, and it has to be typed: an empty list used to
+mean the same thing, which made a forgotten key and a deliberate claim about
+every language the same entry. A change whose files resolve to no known
+language still retrieves nothing, generic entries included. `versions:` and
+`frameworks:` are optional prose, rendered beside the entry for the model to
+judge rather than filtered on, because most applicability cannot be checked
+mechanically.
+
+`applies:` is the half that can be. It holds clauses of the form
+`name op version`, separated by commas, all of which must hold, with `op` one
+of `>=`, `>`, `<`, `<=`, `==`. Only `go` is answerable today, read from the
+repository's root `go.mod`. An entry whose clauses fail is not offered at all:
+`go-time-after-leak` carries `applies: go < 1.23`, because Go 1.23 changed
+timers so an unreferenced one is collected before firing, and a repository
+declaring 1.23 or later never sees the entry. A version this tool cannot read,
+a repository with no `go.mod`, or a clause naming something it does not resolve
+all keep the entry, because silencing on ignorance would make a missing
+`go.mod` look like a corpus with nothing to say. The vectors are
+committed under `internal/knowledge/indexes` and regenerated with `nitpick
+knowledge-index`, one file per embedding model. A run selects the file whose
+recorded model matches `models.embed`, so switching embedder is configuration
+rather than a rebuild:
+
+```yaml
+models:
+  embed:
+    provider: openrouter
+    model: openai/text-embedding-3-small
+```
+
+Four ship, all built from the same corpus:
+
+| model | dimensions |
+|---|---|
+| `synthetic/hf:nomic-ai/nomic-embed-text-v1.5` | 768 |
+| `openrouter/voyageai/voyage-code-4` | 1024 |
+| `openrouter/openai/text-embedding-3-small` | 1536 |
+| `openrouter/qwen/qwen3-embedding-8b` | 4096 |
+
+Which of them retrieves best is unmeasured. They are here so the choice is a
+configuration line rather than a rebuild, and so the held-out evaluation has
+more than one vector space to compare; `voyage-code-4` is trained on code and
+`qwen3-embedding-8b` is open weights, which is the reason those two are the
+ones added.
+
+OpenRouter serves embeddings on `/api/v1/embeddings`, listed separately from
+the chat catalogue at `/api/v1/embeddings/models`. It carries no
+`nomic-embed-text`, which is why the default bundle is Synthetic's.
+
+For any other provider, build your own and name it:
+
+```yaml
+review:
+  knowledge_index: ./my-index.json
+```
+
+This key names a file nitpick opens, so it is ignored when it comes from the
+repository's own `.nitpick.yaml`, along with `linters.trusted`. Put it in the
+user-level file instead. On a runner there is none by default, and
+`NITPICK_USER_CONFIG=/path/to/config.yaml` names one, which keeps the endpoint
+and credential keys refused from the repository file where they are.
+
+An index built by one embedding model refuses a query from another, because
+vectors from two models are not comparable, and every index records the hash of
+the corpus text it was built from. That hash is the half a file listing cannot
+check: an entry *added* without regenerating has no vector and is caught by its
+absence, and an entry *edited* without regenerating keeps its vector under the
+same id, so the counts still agree and retrieval answers from a paragraph
+nobody wrote any more. The hash covers the title and body, which is what gets
+embedded, and not the citation, so correcting a URL does not cost an embedding
+run.
+
+Every reviewing command reads it: `review`, `full-review`, `slop`, the MCP
+review tools and `improve`'s defect pass. Retrieval was wired per command until
+2026-09-08 and only `review` had it, so the same setting meant different things
+depending on what you ran; a test now fails the build if a command builds a
+review engine without it.
+
+A misconfigured embedder stops the run rather than reviewing quietly without
+retrieval, because asking for it and not getting it is a question about the
+configuration. A failure once the review is under way costs that batch its
+extra context and nothing else, and the report records what retrieval did: off,
+active, skipped (something to fix, such as no `models.embed`) or failed (an
+embedder that should have worked). A measurement reads that field, so a run
+whose embedder refused its batches is never scored as the retrieval-on arm.
+
+Three knobs shape retrieval, and all three default to what shipped and what
+was measured, because none of them is an established improvement:
+
+```yaml
+review:
+  knowledge_query: file      # default "batch": the whole batch as one query
+  knowledge_min_score: 0.5   # default 0: keep the closest five whatever they score
+  knowledge_tokens: 1200     # default 0: unbounded, at most five entries
+```
+
+`knowledge_query: file` embeds each changed file separately and merges the
+results, one row per entry at its best score, keeping the file that retrieved
+it. A batch query is dominated by whichever file changed most: a two-line edit
+that is the whole reason retrieval would have helped contributes two lines to a
+query of four hundred. It costs one embedding call per file instead of one per
+batch. `knowledge_min_score` drops entries below a cosine, so a change
+resembling nothing in the corpus gets nothing rather than its five least
+distant entries; the entry cut for scoring 0.4 is as real a failure as the five
+irrelevant ones, which is why it is off. `knowledge_tokens` bounds the rendered
+section including its heading and disclaimer, dropping the least relevant
+entries first, and yields no section at all rather than a heading with nothing
+under it.
+
+The evaluation that would decide whether it should ever default on is
+pre-registered in [Evaluating retrieved knowledge](knowledge-evaluation.md).
+
+It ships off. On its own corpus it took recall from 0.75 to 1.00 with noise
+falling from 0.50 to 0.33 per review
+([Findings](findings.md#retrieved-knowledge-and-a-pre-registration-i-got-wrong-2026-09-08)),
+and that corpus is twelve fixtures written by the same author as the entries
+they retrieve, so it measures retrieval working rather than the corpus covering
+what a repository has.
 
 ## Personality and how much it nitpicks
 
@@ -425,7 +589,9 @@ persona:
     enumerated axes above are always honored, because they are bounded and
     validated. See [Trust model](trust-model.md).
 
-**`nitpick`** is the setting people argue about. It selects which
+### `nitpick`
+
+is the setting people argue about. It selects which
 *classes* of finding get published, where `min_severity` selects how serious
 they must be: independent questions, applied independently.
 
@@ -474,7 +640,7 @@ The text lives in `internal/prompt/model.go`, never widens what a model is
 asked to look for, and shows up in `nitpick explain-config` as the `model`
 layer so it can be read without spending tokens. `review.model_notes: false`
 removes it. The measurements are in
-[docs/comparison.md](comparison.md#tuning-for-glm-53-flash-and-qwen38-27b-2026-09-04).
+[Against Incumbent](comparison.md#tuning-for-glm-53-flash-and-qwen38-27b-2026-09-04).
 
 ## Who may make it spend
 
@@ -502,7 +668,9 @@ model call, and the run says who was refused and what the allowed set is. No
 reaction is deliberate: acknowledging a mention tells someone probing that
 something is listening.
 
-**`max_per_pull_request`** bounds the case the list does not, a person or an
+### `max_per_pull_request`
+
+bounds the case the list does not, a person or an
 automation inside the set in a loop. The count comes from the answers already
 posted on the pull request, so it survives a re-run and needs nothing
 persisted. Answers carry their own marker, so published findings and the
@@ -510,7 +678,9 @@ summary do not count against it: a review that posted five findings would
 otherwise exhaust a cap of five and refuse the first question anybody asked. Where the count cannot be read, the run says the cap is not being
 enforced rather than answering as though it were.
 
-**The workflow should gate too.** `nitpick respond` refuses these comments
+### The workflow should gate too
+
+`nitpick respond` refuses these comments
 itself, but only after a runner has started and the repository is checked out.
 The shipped `.github/workflows/nitpick-respond.yml` tests
 `github.event.comment.author_association` in its `if:`, so a stranger's comment
@@ -518,7 +688,9 @@ costs nothing at all. It also groups concurrency per pull request rather than
 per comment: a burst of twenty comments then costs two runs instead of twenty,
 at the price of dropping the questions cancelled while pending.
 
-**Forked pull requests** are a separate matter and are already handled by the
+### Forked pull requests
+
+are a separate matter and are already handled by the
 shipped workflow, which skips them: reviewing one would need the model key
 present in a run whose code the contributor controls.
 
@@ -546,11 +718,13 @@ It says "Nothing found in what was read" rather than that the change is clean,
 because those are different claims and the coverage notices below it carry the
 difference.
 
-**`prose`** keeps the generated walkthrough. The triage model writes it, and it
+### `prose`
+
+keeps the generated walkthrough. The triage model writes it, and it
 is not shown the change: it sees the findings list and the pull request title.
 Measured over six fixtures, most of the content words in what it wrote do not
 appear in the diff it describes. See
-[Findings](findings.md#should-triage-see-the-change).
+[Findings](findings.md#should-triage-see-the-change-2026-09-07).
 
 Under `receipt` the triage prompt does not ask for a walkthrough at all, so the
 output tokens are not spent on an answer nothing prints.
@@ -570,7 +744,9 @@ question tracked in [Findings](findings.md).
 **A finding for a path nobody reported is dropped**, always, with a line in the
 log. That guard has been there from the start.
 
-**`review.triage_no_new_claims`** closes the gap the path check leaves. A
+### `review.triage_no_new_claims`
+
+closes the gap the path check leaves. A
 finding whose path *was* reported can still come back with a rewritten title
 and rationale, published under the original reporter's name, because the
 attribution is restored a few lines later. Turn this on and the reviewer's own
@@ -623,13 +799,17 @@ runs had no ceiling recorded nothing, so a ceiling added part way through starts
 from zero. When earlier spend has reduced what is left, the review says which
 number it is quoting.
 
-**Rates are yours to supply.** A price is a claim about what a vendor charges
+### Rates are yours to supply
+
+A price is a claim about what a vendor charges
 you, on your account, at your tier. The dated table in `internal/evals` is
 evidence for a measurement, not a promise about anyone's bill, so a ceiling is
 computed only from rates you wrote down. A `max_spend` without them is a
 configuration error rather than a ceiling that silently never binds.
 
-**What gets reviewed.** When the whole diff costs more than the ceiling, files
+### What gets reviewed
+
+When the whole diff costs more than the ceiling, files
 are ranked and the highest-ranked are reviewed until the money runs out. The
 ranking is computed from the diff with no model call, and it is a priority
 rather than a prediction of where the bug is:
@@ -645,7 +825,9 @@ rather than a prediction of where the bug is:
 | A test | Halves it. Worth reviewing, worth reviewing after the code it covers. |
 | Prose or data | Halves it. Markdown, YAML, JSON, lockfiles. |
 
-**The estimate errs high.** Output size is not knowable before the model
+### The estimate errs high
+
+Output size is not knowable before the model
 writes, so `completion_ratio` assumes an answer a quarter the size of the
 prompt, roughly four times what a clean review produces. Over-estimating
 reviews fewer files than it could have and says so; under-estimating spends
@@ -655,7 +837,9 @@ route carries its own ensemble the estimate uses the largest set a batch could
 land in, since which batch takes which route is not known until the router has
 run.
 
-**What the pull request says.** A trimmed review states the ceiling, both
+### What the pull request says
+
+A trimmed review states the ceiling, both
 estimates, and how many files it did not read, with the coverage notices rather
 than inside the walkthrough, so turning `review.summary` off does not turn a
 trimmed review into a silent one. Every dropped file also appears under *Files
@@ -663,7 +847,9 @@ not reviewed* with the ceiling as its reason. Analyzers are unaffected: they run
 over the whole change, so an analyzer finding on a dropped file is still real,
 and only the model's silence there means nothing.
 
-**`min_files`** reviews that many of the top-ranked files even when the ceiling
+### `min_files`
+
+reviews that many of the top-ranked files even when the ceiling
 does not pay for them, and the run reports that it expects to exceed the
 ceiling. Left at zero, a diff whose cheapest file is over the ceiling is
 reviewed not at all, and says so.
@@ -680,7 +866,9 @@ reviewed not at all, and says so.
 One model for everything is the default. Two optional mechanisms change that,
 and both overlay `models.default`, so each entry names only what differs.
 
-**Routes** pick the reviewing model for a batch. The first route whose match
+### Routes
+
+pick the reviewing model for a batch. The first route whose match
 holds wins, and a batch no route matches goes to the review model.
 
 ```yaml
@@ -708,7 +896,9 @@ change does. Naming a kind without configuring `models.router` is a
 configuration error, and routes that match only on languages or file counts
 never call it.
 
-**Ensembles** add reviewers rather than replacing one. Every model listed
+### Ensembles
+
+add reviewers rather than replacing one. Every model listed
 reviews every batch, the findings are pooled, and triage merges and reranks
 them, so a defect two models report independently becomes one finding whose
 agreement is a reason to trust its level.
@@ -735,6 +925,7 @@ which may overrule it.
 validation:
   enabled: false                   # default
   classes: [security, correctness] # empty validates every class
+  targeted: false                  # default
 ```
 
 It costs one model call per published finding, on `models.validate` if set and
@@ -746,6 +937,114 @@ direction that matters, how many real defects an expert talks itself out of.
 An unlisted class is published **without** validation, never dropped, so
 narrowing `classes` can only reduce refutations. Overruled findings are not
 discarded silently; they are reported with the reason.
+
+`validation.targeted` shows the expert the knowledge entries the reviewer had
+in front of it when it wrote the finding, and asks it to name the one that
+decided the verdict. It is off, unmeasured, and does nothing without
+`review.knowledge`, since a finding written without retrieval cites nothing.
+The reason it is not on: it narrows the question from "is this claim true of
+this code" to "is this claim true of this code given this rule", and a wrong
+retrieval makes the second easy to answer confidently and wrongly.
+
+A citation naming an entry the expert was not shown does more than get
+dropped: the verdict resting on it is demoted to `unresolved`, so the finding
+publishes and the reader is told the check did not resolve. An expert naming a
+source it never saw is the strongest signal available that its refutation is
+unreliable, and this tool's rule is that doubt does not delete a finding.
+
+Every published finding lists the entries the reviewer read, as
+`reference read: <id>`, and every withheld one lists the entry its expert
+cited. The ids are the filenames under `internal/knowledge/corpus`.
+
+Like the rest of the `validation` block, `targeted` can be set by the
+repository's own `.nitpick.yaml`, which a change may edit. That is the existing
+position for `validation.enabled` too, and `enabled` is the larger lever, since
+it creates the pass rather than changing its prompt. The trust prune covers
+model endpoints and credentials; see the trust model page.
+
+The entries are shown under a `REFERENCE MATERIAL, NOT THIS CHANGE` marker, and that marker is
+defanged out of the code in the same request. The code is written by the change
+author, so without that a diff opens a reference block of its own and states a
+rule in this tool's voice for the expert to refute a real finding with.
+
+## Two keys a repository file may not supply
+
+`linters.trusted` and `review.knowledge_index` are ignored when they come from
+a repository's own `.nitpick.yaml`, the way `base_url` and `persona.custom`
+already were. Both are named in the log and in `nitpick explain-config`, and
+both are honoured from the user-level file or with
+`NITPICK_TRUST_CONFIG_ENDPOINTS=1`.
+
+Neither names a file, which is what the rest of the `linters` block relies on.
+`linters.trusted` is a privilege grant: it is the only gate on the analyzers
+that run the tree's own code, cargo build scripts for clippy and a project
+autoloader for phpstan, and its own documentation says to name one only where
+every change reviewed comes from people who could already run code in the job.
+`review.knowledge_index` is a path this process opens, with none of the
+containment an analyzer config path has to satisfy.
+
+A `semgrep_config` registry reference now has to look like one: `p/` or `r/`
+followed by a ruleset name, with no traversal, no scheme and no whitespace. It
+is the one analyzer setting that reaches a command line without a path check,
+because a registry reference is a network fetch rather than a file.
+
+## A key this nitpick does not have
+
+An unrecognised key fails the run rather than being ignored, which is right for
+a typo and has a second consequence: a `.nitpick.yaml` written for a newer
+nitpick does not degrade on an older one, it stops the review before a line of
+the diff is read. The two cases are the same bytes from in here. A build that
+has never heard of `models.fix` has never heard of `models.fx` either.
+
+So the default stays fatal and the message says what it can:
+
+```
+error: .nitpick.yaml has keys this nitpick does not know:
+
+  fix (line 34)
+
+This is nitpick v1.8.0. A key added after this version is rejected the same way
+a typo is. Set NITPICK_IGNORE_UNKNOWN_KEYS=1 to ignore them and continue.
+```
+
+Setting `NITPICK_IGNORE_UNKNOWN_KEYS=1` ignores such keys and runs. They are
+named in the log, in `nitpick explain-config`, and on the pull request, for the
+reason a dropped endpoint key is: a setting a reader believes is in force and is
+not is very hard to diagnose. The two audiences differ, which is why it is in
+both places: the operator who set the variable reads the log, and whoever wrote
+the key reads the pull request.
+
+It is an environment variable rather than a config key, one step further than
+`NITPICK_TRUST_CONFIG_ENDPOINTS`: a config file that could switch off the check
+on its own keys is the one thing this must not be.
+
+A decode that fails for any other reason stays fatal with the variable set. A
+document that mixes an unknown key with a value of the wrong type has applied
+some of itself and skipped some, and nothing here knows which, so the file is
+refused rather than reviewed under a config the tool cannot describe.
+
+The case this is for is a binary behind its config: a workflow pinned to an
+older tag, or a monorepo running two pinned versions against one file. Whoever
+sets it is asserting that. Nothing here can check the assertion, so if one of
+the keys was a typo after all, that setting is not in force and the notice is
+the only sign.
+
+An ignored key is not read as a key, which is not the same as the text under it
+being inert. YAML lets an anchor declared under one key be merged into another,
+so a key nitpick does not have can still carry a value that reaches a key it
+does have. Where that value is an endpoint or a credential setting from a file
+this tool does not trust, the load is refused rather than ignored:
+
+```
+error: .nitpick.yaml supplies base_url after the untrusted-key prune ran, which
+means the document reached them by a route the prune does not walk, such as a
+YAML anchor merged into a model spec. It was not applied.
+```
+
+The prune removes those keys by name, so it only removes what it can see. That
+check asks the question the prune exists to answer, on the settings themselves
+after the document is decoded, which is why a route nobody enumerated does not
+get past it. See [Trust model](trust-model.md).
 
 ## Severities
 
@@ -792,7 +1091,13 @@ Two conditions always hold, whatever else is configured:
 - **Every planned file was reviewed.** A run whose batches partly failed
   published no findings for the files it never read, and reading that as
   clean is how an approval comes to mean less than nothing. The files are
-  listed under "Reviewed from the diff only" and its neighbours.
+  listed under "Reviewed from the diff only" and its neighbours. File
+  coverage is required even when an engineering practices profile would
+  otherwise call the pipeline complete on deterministic checks alone.
+
+When those hold, earlier comment threads this tool left on the pull request
+are resolved first (via `review.resolve_superseded`) so the approval is not
+held back by findings the clean run already closed.
 
 `review.approve.require_analyzers` (default off) adds a third: every enabled
 analyzer ran, and none of them reported a coverage gap. Off by default because

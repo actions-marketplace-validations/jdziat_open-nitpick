@@ -1,16 +1,27 @@
 # Development
 
+Working on the tool itself: the tests, which need no network or credentials, the
+commit and release conventions CI enforces, and the eval harness that measures a
+prompt or analyzer change against real models before it ships.
+
 ```bash
 go test ./...        # no network or credentials required
-go test -race ./...
+go test -race -p 1 ./...
 make quick           # measure a prompt or analyzer change for a few cents (see below)
 ```
 
 ## Commits and releases
 
+<a id="releases"></a>
+
 Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/):
 `feat(scope): what changed`, `fix: …`, `docs: …`, `evals: …`, `prompt: …`.
-CI checks every pull request's commits with `scripts/check-commits.sh`.
+CI checks every pull request's commits with `scripts/check-commits.sh`, which
+uses `nitpick commits` and accepts a two-dot `base..head` range. The wrapper keeps
+its historical success for an empty valid range; the standalone CLI reports no
+assessment. Merge exemptions depend on parent count, not a `Merge ` prefix.
+Descriptions are limited to 72 Unicode characters and may not contain control
+characters.
 On each push to main, release-please keeps one pull request open with the
 next version and its changelog; merging it tags the release. The release
 workflow then builds the binaries, writes `checksums.txt`, and signs every
@@ -18,10 +29,10 @@ asset with Sigstore keyless signing, so a download is checkable against this
 repository's workflow identity and nothing else:
 
 ```bash
-cosign verify-blob --bundle nitpick_v1.4.0_linux_amd64.sigstore.json \
+cosign verify-blob --bundle nitpick_v1.11.0_linux_amd64.sigstore.json \
   --certificate-identity-regexp '^https://github.com/jdziat/open-nitpick/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  nitpick_v1.4.0_linux_amd64
+  nitpick_v1.11.0_linux_amd64
 ```
 
 The `v1` tag follows every `v1.x.y` release, which is what the Action's
@@ -33,7 +44,7 @@ The `v1` tag follows every `v1.x.y` release, which is what the Action's
 with related context off and on, against `z-ai/glm-5.3-flash`, about a
 thirtieth of the default reviewer's price per review. It is the model to
 iterate against, and the triage model this repository's own config uses;
-[docs/findings.md](findings.md) records how it compares as a reviewer.
+[Findings](findings.md) records how it compares as a reviewer.
 `QUICK=<openrouter id>` swaps it.
 
 ## Evaluating the prompts against real models
@@ -107,3 +118,23 @@ The whole pipeline is tested against a scripted model and a stub GitHub API, so
 the test suite exercises real behavior rather than mocks of its own design. Diff
 position mapping is additionally cross-checked against real `git diff` output by
 a second, independent implementation.
+
+
+### Language standards integration tests
+
+`TestLanguageConventionLintersRejectViolationsAndAcceptCleanFiles` runs Ruff,
+ESLint, PMD, and RuboCop on bad and clean fixtures, including project configs
+that try to disable rules. Install the pinned tools outside this checkout with
+`scripts/install-language-linters.sh /tmp/nitpick-language-tools`. The script
+requires Python with venv, Node 24, Ruby, Java 21, curl, and unzip. Add its
+`python/bin`, `node/node_modules/.bin`, `gems/bin`, and `pmd-bin-7.27.0/bin`
+directories to `PATH`, and set `GEM_HOME` and `GEM_PATH` to its `gems` directory.
+
+Run the integration checks with all four tools required:
+
+```bash
+NITPICK_REQUIRE_LANGUAGE_LINTERS=1 go test ./internal/linters -run '^TestLanguageConvention' -count=1 -v
+```
+
+ CI uses that
+mode so a missing binary fails instead of skipping the integration tests.

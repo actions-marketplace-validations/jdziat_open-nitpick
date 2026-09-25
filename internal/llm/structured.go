@@ -139,7 +139,12 @@ func generateTyped[T any](ctx context.Context, c *Client, msgs []llms.Message, c
 // generateContent is GenerateContent with generateTyped's retries.
 func generateContent(ctx context.Context, c *Client, msgs []llms.Message, call []llms.CallOption) (*llms.Response, error) {
 	for attempt := 0; ; attempt++ {
-		resp, err := c.LLM.GenerateContent(ctx, msgs, call...)
+		var resp *llms.Response
+		err := whileWaiting(ctx, c.Log, "model call", c.String(), waitInterval, func() error {
+			var err error
+			resp, err = c.LLM.GenerateContent(ctx, msgs, call...)
+			return err
+		})
 		if next, ok := c.retryAfter(ctx, attempt, call, resp, err); ok {
 			call = next
 			continue
@@ -164,6 +169,21 @@ func (c *Client) retryAfter(ctx context.Context, attempt int, call []llms.CallOp
 			"timeout", c.Timeout(),
 			"output_capped", !hasMaxTokens(call) && hasMaxTokens(next))
 		return next, true
+	case emptyAtLengthCap(resp):
+		// A reasoning model that spent the whole output budget on thinking
+		// returns finish_reason=length with content "". poolside/laguna-s-2.1
+		// did this on 2 of 88 full-review batches under an inherited
+		// max_tokens: 8192: both the first call and the JSON repair saw empty
+		// content, and the files went unreviewed. Retry with reasoning off and
+		// a floor on the cap so the next attempt has room for an answer.
+		// Deliberately not the same as truncated(): a first attempt cut mid-
+		// JSON at a cap the caller chose is still theirs (see below).
+		next := emptyAnswerRetryOptions(call)
+		c.logger().Warn("model hit the output cap with empty content; sending again with reasoning off",
+			"model", c.String(),
+			"attempt", attempt+1,
+			"retries_left", c.stallRetries-attempt)
+		return next, true
 	case attempt > 0 && truncated(resp, err) && !hasTemperatureAbove(call, 0):
 		// Only after a retry: a first attempt cut at a cap the caller chose is
 		// the caller's to handle. Only from temperature zero: a sampling
@@ -176,6 +196,30 @@ func (c *Client) retryAfter(ctx context.Context, attempt int, call []llms.CallOp
 		return append(append([]llms.CallOption(nil), call...), llms.WithTemperature(runawayRetryTemperature)), true
 	}
 	return nil, false
+}
+
+// emptyAtLengthCap reports a response that hit the output budget without
+// producing an answer. Reasoning models do this when thinking consumes every
+// completion token; the HTTP call succeeds, so stalled() never fires, and the
+// JSON repair path then retries the same empty shape.
+func emptyAtLengthCap(resp *llms.Response) bool {
+	if resp == nil || resp.FinishReason != llms.FinishReasonLength {
+		return false
+	}
+	return strings.TrimSpace(resp.Content) == ""
+}
+
+// emptyAnswerRetryOptions disables reasoning and raises a tight max_tokens so
+// the next attempt can emit content. A caller's higher cap is kept.
+func emptyAnswerRetryOptions(call []llms.CallOption) []llms.CallOption {
+	off := false
+	next := append(append([]llms.CallOption(nil), call...),
+		llms.WithReasoning(llms.ReasoningConfig{Enabled: &off}))
+	applied := llms.ApplyOptions(call...)
+	if applied.MaxTokens == nil || *applied.MaxTokens < creditCappedMaxTokens {
+		next = append(next, llms.WithMaxTokens(creditCappedMaxTokens))
+	}
+	return next
 }
 
 // runawayRetryTemperature is what a request is re-sampled at after a
@@ -357,7 +401,7 @@ func extractJSON[T any](ctx context.Context, c *Client, msgs []llms.Message, opt
 	}
 
 	// Repair: show the model its own output and the parse error.
-	repair := append(prompted,
+	prompted = append(prompted,
 		llms.Message{Role: llms.RoleAssistant, Content: resp.Content},
 		llms.Message{Role: llms.RoleUser, Content: fmt.Sprintf(
 			"That response could not be parsed: %v\n\n"+
@@ -365,7 +409,7 @@ func extractJSON[T any](ctx context.Context, c *Client, msgs []llms.Message, opt
 			parseErr)},
 	)
 
-	retry, err := generateContent(ctx, c, repair, call)
+	retry, err := generateContent(ctx, c, prompted, call)
 	if err != nil {
 		return zero, fmt.Errorf("%s: repair attempt failed: %w (original parse error: %w)", c, err, parseErr)
 	}
@@ -656,8 +700,11 @@ func extractJSONCandidates(s string) []string {
 
 		end, ok := matchBalanced(s, i)
 		if !ok {
-			// Unterminated from here; nothing later can close it either.
-			break
+			// An unbalanced opener in prose (e.g. a literal brace in a
+			// description string) does not terminate the rest of the response.
+			// Continue scanning so a well-formed answer object later in the
+			// response is still extracted.
+			continue
 		}
 
 		out = append(out, s[i:end+1])

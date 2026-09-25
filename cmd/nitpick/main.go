@@ -12,6 +12,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"github.com/jdziat/open-nitpick/internal/config"
 )
 
 // version is set at build time via -ldflags.
@@ -31,6 +33,10 @@ func main() {
 }
 
 func run() int {
+	// The version the linker set, where a message about what this build knows
+	// can reach it. internal/config cannot see a package main variable.
+	config.Version = version
+
 	if len(os.Args) < 2 {
 		usage()
 		return exitUsage
@@ -51,8 +57,16 @@ func run() int {
 		err = runRepoScore(ctx, os.Args[2:])
 	case "improve":
 		err = runImproveCLI(ctx, os.Args[2:])
+	case "repo-standards":
+		err = runRepoStandards(ctx, os.Args[2:], os.Stdout)
+	case "commits":
+		err = runCommits(ctx, os.Args[2:], os.Stdout)
+	case "standards":
+		err = runStandards(ctx, os.Args[2:])
 	case "slop":
 		err = runSlop(ctx, os.Args[2:])
+	case "security":
+		err = runSecurity(ctx, os.Args[2:])
 	case "respond":
 		err = runRespond(ctx, os.Args[2:])
 	case "mcp":
@@ -60,13 +74,17 @@ func run() int {
 	case "auth":
 		err = runAuth(os.Args[2:], os.Stdin, os.Stdout)
 	case "init":
-		err = runInit(os.Args[2:], os.Stdout)
+		err = runInit(ctx, os.Args[2:], os.Stdout)
 	case "explain-config":
 		err = runExplainConfig(os.Args[2:])
 	case "linters":
 		err = runLinters()
 	case "providers":
 		err = runProviders()
+	case "knowledge-index":
+		err = runKnowledgeIndex(ctx, os.Args[2:], os.Stdout)
+	case "config-reference":
+		err = runConfigRef(os.Args[2:], os.Stdout)
 	case "version", "--version", "-v":
 		fmt.Println("nitpick", version)
 		return exitOK
@@ -101,6 +119,13 @@ func run() int {
 // errFindings signals that the review succeeded but found gating issues.
 var errFindings = errors.New("findings at or above the configured threshold")
 
+// errIncomplete ends a run that produced output but did not finish.
+//
+// It exits 2 rather than 1 because it is not a statement about the code: the
+// gate was never reached, and a caller that reads exit 1 as "the change has
+// problems" would be told something nobody measured.
+var errIncomplete = errors.New("the review did not complete; see the stages it reports")
+
 func usage() {
 	fmt.Fprint(os.Stderr, `nitpick: self-hosted, model-agnostic pull request review
 
@@ -110,8 +135,12 @@ Usage:
                                    Review the whole tree, or the paths given, with a remediation plan
   nitpick repo-score [flags] [path...]
                                    The same, plus slop, bug and security findings per thousand lines, by language
+  nitpick repo-standards [flags]   Measure repository conventions and enforce them with linters
+  nitpick commits [flags]          Validate commit subjects against accepted policy
   nitpick improve [flags]          The wider pass: the classes a normal review filters out
   nitpick slop [flags] [path...]   AI slop only: the tells without a model, the model's slop rules, a score, and fixes
+  nitpick security [flags] [path...]
+                                   Security scan: required scanners (osv, gitleaks, …), optional model, roster proves completeness
   nitpick respond [flags]          Answer an @open-nitpick comment on a pull request (review again, resolve, or a question)
   nitpick mcp [flags]              Serve the review tools to an agent session over the Model Context Protocol (stdio)
   nitpick mcp install <client>     Register that server with an agent client (claude-code, cursor, opencode, codex, ...)
@@ -120,6 +149,7 @@ Usage:
   nitpick explain-config [flags]   Show the resolved configuration and prompts
   nitpick providers                List available model providers
   nitpick linters                  List the deterministic analyzers and how each is configured
+  nitpick config-reference         Print every configuration key, its type and its default
   nitpick version                  Print the version
 
 Run "nitpick <command> -h" for a command's flags.

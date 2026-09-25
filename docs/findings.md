@@ -3,7 +3,7 @@
 What has been measured, and what it does and does not support.
 
 Numbers here are dated and provisional. Read
-[measurement.md](measurement.md) first: several of the results below were
+[Measurement](measurement.md) first: several of the results below were
 produced by an instrument that was itself wrong, and the corrections matter more
 than the original figures.
 
@@ -14,7 +14,7 @@ question, and the change that improved detection made noise worse.** That is
 the whole of what is supportable, and the two halves have to be read together.
 
 Counted, no judge, on real pull requests (2026-09-03, 44 pull requests on
-`jdziat/nitpick-bench`, [remediation.md](remediation.md)):
+`jdziat/nitpick-bench`, [Remediation](remediation.md)):
 
 | | open-nitpick | Incumbent |
 |---|---|---|
@@ -63,8 +63,8 @@ from the tree. Our own side is a live measurement and does not.
 
 ## What the instrument got wrong
 
-Eighteen measurement bugs have been found, listed below. Six of them scored
-against Incumbent and six flattered whichever behaviour this project would
+Twenty measurement bugs have been found, listed below. Six of them scored
+against Incumbent and seven flattered whichever behaviour this project would
 rather see (silence, selective reporting, or the author's own argument), which
 is why this section exists at all: none were bugs in open-nitpick, and every one
 would have produced a confident wrong number.
@@ -72,7 +72,10 @@ would have produced a confident wrong number.
 The count is the number of rows in the table, so it moves when the table does.
 It said "nine" against fourteen rows for two rounds, which is the same failure
 these documents keep recording one size down: a figure restated rather than
-recomputed.
+recomputed. It came back one size smaller: two bugs found later were numbered
+in the prose of their own dated sections, "the tenth" and "the eleventh"
+against a table that already had eighteen rows. Both are rows now, and a bug
+found from here on gets a row rather than an ordinal.
 
 | bug | effect | direction |
 |---|---|---|
@@ -94,6 +97,8 @@ recomputed.
 | the withdrawal applied to one of the metric's two renderings | `O-*` was gated on vocabulary and the `SEV a/i/u` cell was formatted inline, so "a foreign row prints `n/a`" held only because that table had no foreign row | latent |
 | `STABLE` returned `yes` for five silent runs | the column's best value went to a reviewer that never spoke; a wobbly correct one got `NO` | favoured silence |
 | the retraction's own figures (`10 of 10`, `0.62 → 0.88`, `O-ACC 0.63`) | none reproduced; each overstated the case it was making | favoured the author |
+| two unplanted defects shipped in the tuning corpus | a 0600 to 0666 file mode and an error string written to an HTTP response were scored as noise against every model that reported them | against whichever reviewer read the code |
+| the grounding instrument counted tokens the template forbids the walkthrough to name | numerator and denominator were both zero, so six walkthroughs from two arms all scored a perfect 1.00 | favoured the arm that wrote less |
 
 ### The correction that mattered most
 
@@ -202,7 +207,7 @@ Rule 6.
 ## v1 head-to-head
 
 Both sides measured on the same 30-fixture corpus, `glm-5.2` and `kimi-k3` at two
-runs each. The deciding numbers come from the HELD-OUT corpus, which the prompt was
+runs each. The deciding numbers come from the held-out corpus, which the prompt was
 never tuned against.
 
 ### Detection: counted, no judge
@@ -268,7 +273,7 @@ ruby-default-page-size, and the shipped severity ladder illustrated `info` with
 "Adding a dependency for one helper function is info" three lines above "do not
 go looking for them": the prompt named one of the two plants and then told the
 reviewer to ignore it. That illustration has since been replaced and the figure
-above has NOT been re-measured under the new wording, so this row is stale in a
+above has not been re-measured under the new wording, so this row is stale in a
 known direction for our column only. The incumbent's column is unaffected: it
 never reads our prompt.
 
@@ -279,7 +284,7 @@ being the thing this project has gotten wrong most often.
 ## The incumbent's baseline, on the full corpus
 
 Incumbent was re-collected over all 30 fixtures after the corpus grew, because
-its cached reviews covered only the original 15 (the set the prompt had been
+its cached reviews covered only the first 15 fixtures (the set the prompt was
 tuned against for seven rounds). Scored deterministically, no judge:
 
 | | detection | findings | unexplained | precision |
@@ -315,7 +320,7 @@ severity and therefore could not see this floor at all. They are superseded.
 
 ## Judge instability
 
-Documented in [measurement.md](measurement.md#the-two-kinds-of-column-and-why-it-matters):
+Documented in [Measurement](measurement.md#the-two-kinds-of-column-and-why-it-matters):
 four runs over byte-identical cached findings gave grades from 3.66 to 3.98 and
 `MISSED` from 0.12 to 0.62, at `Temperature: 0`.
 
@@ -580,7 +585,7 @@ temperature zero is real, and this is inside it.
 **What it costs in lost reviews, and why: found and fixed.** glm-5.3-flash
 lost 2 of 16 reviews on the tuning corpus and 3 of 40 on the multi-file
 corpus in this run, and 11 of 88 the next evening, to "all review batches
-failed" with no response recorded. `TestProbeModel` caught one with the
+failed" with no response recorded. `TestProbeModelReportsRawFailures` caught one with the
 engine's log:
 
     schema path failed (structured output is not valid JSON: invalid character 'L' ...);
@@ -713,7 +718,7 @@ Two batteries, kimi-k3, 3 runs each, against the shipped Incumbent cache.
 | nit | 5/9 | 0/3 |
 | **located** | **38/48 = 0.79** | **10/16 = 0.62** |
 
-THE TWO SPLITS TELL DIFFERENT STORIES AND THE DIFFERENCE IS THE POINT. On the
+The two splits tell different stories, and the difference is the point. On the
 tuning corpus the blocking bands are a dead heat (10 of 10 each on
 critical+error+warning), and the whole margin is info and nit, where Incumbent
 locates nothing and may not publish at all. Quoting the tuning total alone would
@@ -731,7 +736,7 @@ it counts: critical 1.00 against 0.50, warning 1.00 against 0.33, error tied.
 
 Rule 14 says any one failing means do not ship. **Do not ship v1 yet.**
 
-WHY CONDITION 3 FAILS, AND WHAT IT DOES AND DOES NOT SAY. Judged precision is
+Why condition 3 fails, and what it does and does not say. Judged precision is
 0.80 for us and 0.83 for Incumbent, within a hair, and well inside a
 single-judge figure whose cross-judge disagreement was never measured. What
 differs is VOLUME: 0.88 findings per review against 0.43. At near-equal
@@ -748,7 +753,7 @@ pre-registration exists to prevent.
     TUNING corpus Incumbent's judged precision was 13/13, so 1.5x0 = 0 and any
     noise at all fails. A threshold that a perfect-precision incumbent makes
     unsatisfiable is not a threshold. It needs an absolute floor.
-  - Condition 4 named a column the benchmark DID NOT PRINT AT THE TIME. ANCHOR
+  - Condition 4 named a column the benchmark did not print at the time. ANCHOR
     appeared in the prompt-battery cost table and not in the head-to-head, so a
     condition could not be evaluated by the run it governs. **The instrument has
     since been repaired and this row is history, not current state:** the
@@ -771,10 +776,10 @@ All three were written or read by an author who had already seen a favourable
 narrow result, which is disclosed in Rule 14 and is the reason to read them
 sceptically rather than to trust that they were merely unlucky.
 
-### What is NOT claimed
+### What this does not claim
 
 No cross-tool severity accuracy: incumbent/cli's O-* columns are withdrawn by
-construction, its one `critical` spanning our critical AND error. GRADE is 3.77
+construction, its one `critical` spanning both our critical and our error. GRADE is 3.77
 against 3.14 with spreads of 2.30 and 4.30, a gap far inside either spread, so
 it is not a ranking. Every judged figure is one model's opinion with its
 cross-judge disagreement unmeasured, printed `+?`. Our side lost 2 runs of 42 to
@@ -810,7 +815,7 @@ By band, and this is where the incumbent's shape shows:
 Perfect on critical, error and warning; the incumbent locates 4 of 8 across those
 three. Both locate nothing at `info`.
 
-### THE HELD-OUT CORPUS WAS SPENT TWICE AND THIS IS THE SECOND LOOK
+### The held-out corpus was spent twice, and this is the second look
 
 It is meant to be spent once. The first spend could not evaluate the rule (two
 of four conditions had no column), so the instrument was fixed and it was spent
@@ -834,7 +839,7 @@ The drift is itself worth recording: 0.68 to 0.74 is about two defects on a
 corpus whose smallest expressible difference is one. Run-to-run variance at
 temperature 0 is real here and is not a rounding effect.
 
-### What this does NOT establish
+### What this does not establish
 
 - **Condition 3 was loosened after it failed.** Rule 14a states the direction and
   the reasoning; the timing is what pre-registration exists to distrust.
@@ -843,7 +848,7 @@ temperature 0 is real here and is not a rounding effect.
   singleton, is a pattern the standard library ships), so that band measures
   something below every tested reviewer's threshold rather than a gap.
 - **No cross-tool severity accuracy.** incumbent/cli's O-* cells are withdrawn by
-  construction; its one `critical` spans our critical AND error.
+  construction; its one `critical` spans both our critical and our error.
 - **GRADE is not a ranking.** 3.91 against 3.12 with spreads of 2.00 and 4.30.
   Single judge, cross-judge disagreement unmeasured, printed `+?`.
 - **The incumbent's raw text is not retained on this path**, only parsed findings,
@@ -881,8 +886,9 @@ Read the run dumps first; most of the noise was ours.
 
 - **Two unplanted defects shipped in the corpus** and were scored as noise
   against every model that found them (a 0600 to 0666 file mode, an error
-  string written to an HTTP response). Fixed at the fixture. This is the
-  tenth instrument bug, and the first found by three models agreeing.
+  string written to an HTTP response). Fixed at the fixture. It is in the
+  table above, and the first instrument bug there found by three models
+  agreeing.
 - **Two base-prompt rules cut noise for every model measured**, the default
   included: a consequence must be reachable with what was shown, and an
   untouched helper is judged by its contract. Multi-file noise: glm 0.64 to
@@ -925,7 +931,7 @@ Read the run dumps first; most of the noise was ours.
   mode) were found by the pinned run within an hour of each other.
 - **Raw control characters inside JSON strings** are now escaped by the
   lenient decoder. Without a response format, gemma emits them on most
-  replies; with one, the provider had been hiding the habit.
+  replies; with one, the provider hides the habit.
 
 ## Routing and ensembles (2026-09-05)
 
@@ -1568,8 +1574,8 @@ and file names, scored both arms a perfect 1.00 over six walkthroughs, and the
 reason was that it found zero tokens: the same template forbids naming files
 ("no bullet lists of files, no statistics, no restating the diff"). An
 instrument that returns a perfect score because its numerator and denominator
-are both zero is the eleventh instrument bug here, and the second to flatter
-the arm that produced less.
+are both zero is in the table above, with the others there that rewarded the
+arm which produced less.
 
 **Not measured: cost.** Grounding sends the whole diff to the triage model on
 every review. The tokens were never counted, and `review.budget`'s `overhead`
@@ -1580,3 +1586,1014 @@ the walkthrough is now counted from the report instead; see
 
 Rule 15 applies. One model, one run, six fixtures, and the headline number is
 a proxy the section above says cannot separate paraphrase from invention.
+
+## Retrieved knowledge, and a pre-registration I got wrong (2026-09-08)
+
+The knowledge corpus is twelve fixtures under Rule 15: six plants whose defect
+needs one specific fact, each paired with a control whose code attracts the same
+corpus entry and contains nothing wrong. `z-ai/glm-5.3-flash` through
+OpenRouter, two runs per arm, 24 reviews per arm, none lost. Judge-free.
+
+| arm | embedder | RECALL | NOISE / review | $ / review |
+|---|---|---|---|---|
+| retrieval off | none | 0.75 | 0.50 | $0.0002 |
+| retrieval on | synthetic, nomic-embed-text-v1.5 | **1.00** | **0.33** | $0.0003 |
+| retrieval on | openrouter, text-embedding-3-small | **1.00** | **0.33** | $0.0005 |
+
+The off arm builds no retriever, so it is the control for both. The two
+embedders land on the same recall and the same noise from different vector
+spaces and different dimensions, 768 against 1536, which is more than one run
+of six plants can distinguish and less than a claim that they are equivalent.
+
+Recall is located plants over plants across every review, so 0.75 is 18 of 24
+and 1.00 is 24 of 24. Per run of six plants that is 4.5 found without
+retrieval and 6 with it.
+
+**The plant that moved is the one worth naming.** `know-go-time-after-leak` was
+missed in all four reviews without retrieval and found in all four with it. It
+is the fixture whose defect is least visible from the diff alone: a
+`time.After` in a select loop looks like ordinary idle-timeout code, and the
+reason it leaks is a sentence in the standard library's documentation about
+when the timer is recovered.
+
+**Noise fell rather than rose**, 0.50 to 0.33 per review, and the six controls
+drew no plant-shaped finding in either arm. That was the outcome most at risk:
+reference material beside a diff is a standing invitation to report the
+reference, and the section's heading says three times over that none of it was
+written about the change under review.
+
+### The pre-registration does not fit the corpus, and that is my error
+
+The plan fixed the threshold before the corpus existed, at *"at least 3 of 12
+plants"*. The corpus as built has **six** plants and six controls, so the
+threshold as written cannot be evaluated: there was never a twelfth plant to
+find three of.
+
+Read proportionally, 3 of 12 is a quarter of the plants, and the observed gain
+is 1.5 of 6, which is also a quarter. So the condition is met on the reading
+that survives the arithmetic, and I am recording that it is a reading rather
+than the thing I committed to. Rule 14's preamble is about exactly this failure
+and I walked into a version of it: a threshold written before the instrument
+was built is not automatically a threshold the instrument can express.
+
+### What this does not establish
+
+Every plant has a matching corpus entry by construction. A separate check
+confirms retrieval puts that entry in the prompt for all six, at ranks 1, 1, 1,
+2, 3 and 3 of at most five kept, so the gain is retrieval working rather than
+run-to-run variance. What it is not is evidence that the corpus covers defects
+a real repository has: fourteen entries were chosen by one author, and the
+corpus was written before the fixtures that measure it.
+
+Two runs per arm on six plants also cannot separate a real 1.5-plant gain from
+a fortunate pair of runs. Rule 3 wants two passes and a gap wider than the
+spread; this has the passes and the gap is 1.5 plants against a resolution of
+one, which is thinner than it looks.
+
+`review.knowledge` stays off by default.
+
+### The provider claim in this section was wrong
+
+The arm above embedded through OpenRouter because I recorded that synthetic,
+the provider this repository runs, could not embed. That came from the SDK's
+per-provider capability flag, which reports `Embeddings: false` for synthetic.
+Synthetic serves an embeddings endpoint: `hf:nomic-ai/nomic-embed-text-v1.5`,
+768 dimensions, included in the subscription at no additional charge.
+
+The index ships built on it now, and the arm was re-run: the table above has
+both. Retrieval reaches all six plants on synthetic at ranks 1, 1, 1, 1, 1 and
+3, against 1, 1, 1, 2, 3 and 3 on OpenRouter, and the two arms score the same.
+Better ranks did not buy better recall here, which they could not: the on arm
+finds every plant, so there is nothing above it to reach.
+
+The lesson is narrower than "the SDK was wrong": a capability flag is metadata
+about a provider, and the only check worth trusting is a request.
+
+## Vectors cannot tell a finding from noise (2026-09-08)
+
+Asked whether the corpus and the embedder could classify a published finding as
+noise. Three mechanisms, three measurements, all negative, and the one number
+that looked positive was circular.
+
+The labels come from runs already recorded: a finding the keyword rule credited
+against a plant is real, one explaining no plant is noise. 291 findings across
+two corpora collected four days apart.
+
+### Similarity to the knowledge corpus
+
+| corpus the findings came from | real, mean cosine | noise, mean cosine | best single threshold | baseline |
+|---|---|---|---|---|
+| knowledge (12 fixtures) | 0.733 | 0.538 | **0.938** at cut 0.658 | 0.531 |
+| callers (6 fixtures) | 0.533 | 0.536 | 0.528 at cut 0.615 | 0.478 |
+
+The first row is the artifact. Every plant in the knowledge corpus has a
+matching entry by construction, because the entries were written first and the
+fixtures were written to need them. So "real finding" and "finding the corpus
+covers" are the same set there, and 0.938 measures that identity rather than
+any property of noise.
+
+The second row is the test that counts. On findings from a corpus the entries
+were not written for, real and noise sit 0.003 apart on a scale where a single
+fixture moves more than that, and the best threshold beats always-guessing by
+five points, which one run cannot distinguish from nothing.
+
+### Past labelled findings as the index
+
+Nearest-neighbour over 161 labelled findings from one corpus, classifying 130
+from the other:
+
+| k | accuracy |
+|---|---|
+| 1 | 0.492 |
+| 3 | 0.469 |
+| 5 | 0.485 |
+| always the majority class | **0.531** |
+
+Every k is worse than guessing. Not weakly informative, not marginal: a coin
+that always says "real" beats all three.
+
+### What this says, and what it does not
+
+An embedding of a finding's title carries what the finding is *about*, and
+being about a nil map is not evidence either way about whether this particular
+nil map is reachable. That is the thing a validator has to decide and the thing
+a vector does not encode.
+
+The measurement is on titles alone. A rationale, the diff hunk, and the
+surrounding code are all available and none was tried, so this rules out the
+cheap version rather than the idea. It also says nothing about a reranking
+model reading the finding and the code, which is a model call rather than a
+vector comparison and is what `internal/review/validate.go` already does.
+
+The retrieval feature keeps its own result: noise fell from 0.50 to 0.33 per
+review with retrieval on. That is context helping a model judge, not a vector
+judging on its own, and the difference is the whole of this section.
+
+### The model that reads the finding and the code did not do better
+
+`internal/review/validate.go` is that mechanism and already exists: an expert
+persona is shown a finding and the code it names, and overrules it with a
+stated reason. Turning it on over the same corpus, same model, two runs:
+
+| arm | RECALL | NOISE / review |
+|---|---|---|
+| retrieval on | **1.00** | 0.33 |
+| retrieval on, validation on | 0.83 | 0.29 |
+
+Recall fell from 24 of 24 plant-locations to 20 of 24. Noise fell by 0.04 per
+review on one contender and not at all on the other, against a corpus
+resolution where one plant is 0.083.
+
+So the validator paid four real findings for something smaller than this
+instrument can measure. `know-go-defer-in-loop` is the clearest case: found in
+every run without validation, overruled in one run with it.
+
+That is one corpus, one model, two runs, and validation was built for a
+different job than noise reduction on twelve fixtures. What it does say is that
+the obvious escalation from a vector to a model did not rescue the idea here,
+and the thing that did reduce noise was giving the reviewer better context in
+the first place.
+
+## No reranker, on arithmetic (2026-09-08)
+
+The retrieval design left a `Rerank` hook on the retriever: a cheap chat model
+that would read the candidate titles and choose which reach the prompt. Nothing
+ever set it. Before building one, I counted what it could change.
+
+Retrieval cuts the corpus by language, then by the asking pass's classes, then
+by the versions an entry declares, and keeps the top five of what survives.
+The reranker only matters when that keep truncates, so the question is the size
+of the pool it truncates.
+
+| language | entries the cuts allow | truncated at keep = 5 |
+|---|---|---|
+| go | 8 | yes |
+| python | 2 | no |
+| typescript | 2 | no |
+| javascript | 1 | no |
+| rust | 1 | no |
+| shell | 1 | no |
+
+Source: `TestPoolSizeReportsWhatTheCutsAllowed` in
+`internal/knowledge/applies_test.go`. The column sums to 15 over fourteen
+entries because `js-array-sort-mutates` declares both javascript and
+typescript, so it is in two pools. On a
+module declaring Go 1.23 or later the Go pool is 7, because `go-time-after-leak`
+is bounded below it.
+
+For five of the six languages truncation is the identity: every entry the cuts
+allowed reaches the prompt whatever order it is in. A reranker would spend one
+model call per batch to reorder a list that is then not cut. The one place it
+could act is Go, where it would choose which 3 of 8 entries to drop.
+
+So the hook is deleted rather than filled. An unimplemented interface implies
+somebody decided how to rank, and a reader finding it has no way to see that
+nothing is behind it.
+
+What replaces it is the number, in every run: `knowledge retrieved` now logs
+`pool` beside `entries`, so a corpus that has grown past the point where keep
+binds says so in the log rather than in somebody's memory of this table. The
+condition to revisit this is written here rather than left implicit: when the
+pool exceeds keep for most retrievals rather than one language in six, a
+reranker has something to do, and it can be measured against the cosine order
+as the control.
+
+## Regenerating the index is not a pure function of the corpus (2026-09-08)
+
+Editing one corpus entry and regenerating all four bundles moved two other
+entries' vectors. Measured on the diff, comparing per-entry vectors before and
+after:
+
+| entry | model | components differing | max delta | cosine |
+|---|---|---|---|---|
+| sql-rows-err-unchecked | text-embedding-3-small | 1209 of 1536 | 1.22e-4 | 0.999999228 |
+| rust-mem-forget-leak | voyage-code-4 | 598 of 1024 | 1.30e-7 | 1.000000000 |
+
+Neither entry's text changed. This is provider-side nondeterminism, and at that
+magnitude it cannot reorder retrieval: the corpus's nearest neighbours are
+separated by far more than 1e-4.
+
+Recorded because the `corpus` hash pins the text and nothing pins the vectors,
+so a bundle regenerated from an unchanged corpus is a clean diff by the test's
+standard and a changed file by git's. Nothing here needs fixing. What it rules
+out is treating a bundle diff as evidence that the corpus changed.
+
+## Targeted validation: what would decide it, and when (2026-09-09)
+
+`validation.targeted` ships off and unmeasured, and it is now the
+best-defended path in the validation pass: the reference marker, the
+conditional contract, `defang`, and a citation check that demotes a verdict
+naming an entry the expert was not shown. Four defences on a feature nobody
+has evidence for is a standing cost, so this records what would settle it
+rather than leaving that to whoever next reads the code.
+
+The measurement is the one this repository already runs. Two arms over the
+knowledge corpus, `validation.enabled` on in both, `validation.targeted` the
+only difference, two runs each, `review.knowledge` on so findings carry
+evidence at all. Recall and noise per review, the same pair every arm here is
+scored on.
+
+Ship condition, written before the number: targeted must not cost recall, and
+must reduce noise by more than one finding per review. Noise is counted per
+review over the corpus's twelve fixtures, so one finding is 1/12 = 0.083 and
+anything smaller is inside what this instrument can resolve. Recall is the
+coarser of the two and is not the same number: `CorpusResolution` reports its
+step as 1/6 = 0.167, one defect over the six the corpus plants, so "must not
+cost recall" means no defect lost rather than a fraction of one.
+
+Kill condition, so the holding position expires: if that measurement has not
+run by the release after the one carrying this branch, the flag, the
+`referenceContract`, the reference fence and the citation check come out. The
+evidence line on a published finding stays either way, because it costs no
+model call and is checkable by a reader on every run.
+
+## A convention is a count, and the denominator is what goes wrong (2026-09-10)
+
+`internal/standards` measures what this repository demonstrates rather than
+asserting it, so that a rule the code stops following stops being reported.
+Every probe names the places it has an opinion about and how many of them
+conform, and the share is the whole claim.
+
+Three readings of the same question were wrong before one was right, all three
+in the direction that keeps a real convention out of the report:
+
+| Reading of "an exported declaration's doc comment opens with its name" | Result | Reads as |
+| --- | --- | --- |
+| the line directly above the declaration | 109/262, 42% | not a standard |
+| the first line of the comment block | 259/262, 98% | a standard |
+| the same, counting test files | 1221/2000, 61% | not a standard |
+| the same, test files excluded | 686/723, 95% | a standard |
+
+The first is a multi-line comment ending on a line that does not repeat the
+name. The third is a test function: exported, and never documented by godoc, so
+counting it asks whether this repository writes doc comments on its tests, which
+nobody intends. Neither bug changes which sites are reported as violations, so a
+test asserting only the violations would have passed against both. Every probe
+therefore asserts its conforming count and its total, and owns a test naming
+what is deliberately not a site.
+
+A fourth was found by mutation rather than by reading. `opensWith` assigned the
+first comment line and then re-derived it in a loop, so replacing the first
+assignment with the last changed nothing and the mutation survived. The dead
+assignment is gone. A fifth was a test of the parameter walk that could not
+fail: reading a Go parameter list by field and by parameter agree on "is the
+context first" for every input, so the walk is by field now and the test pins
+the answer instead of the mechanism.
+
+The floor is two numbers, 85% over 12 sites, because a share alone lies at small
+counts: three sites out of three is 100% and is evidence of nothing. Below either
+number a probe reports as `contested` and scores no change. The two are
+configurable so a repository midway through adopting a convention can watch the
+number climb before the rule is asserted.
+
+Measured on this repository the day the package landed, all six probes clearing
+the floor: doc comments 691/728, error wrapping 194/194, context first 220/221,
+no naked return 49/51, test names 1168/1192, test helpers marked 132/132. The
+three violations the probes name are real and a maintainer recognises them.
+
+What this does not establish: that these six are the conventions worth having,
+or that a probe measuring the right thing was written for each. Six probes over
+one language is a start on an instrument, not a verdict on a codebase, and the
+number a probe reports is worth exactly what its denominator is worth.
+
+### The conventions file is generated, budgeted, and drift-gated (2026-09-10)
+
+AGENTS.md carries what `internal/standards` measured, and `make agents`
+regenerates it. CI runs the same command and fails on `git diff --exit-code`, so
+a change that moves a convention updates the file that tells agents about it, in
+the pull request that moved it.
+
+Only the block between `<!-- nitpick:standards:begin -->` and its closing marker
+is generated. Everything outside is preserved byte for byte, which is where the
+gates, the build commands and anything else no probe can see belong. The drift
+gate therefore covers the block alone, which is the only part this tool has any
+claim to know.
+
+The budget is 120 lines for the block. Length is how a conventions file fails:
+past a screen or two nobody reads to the end, and the rules that matter are
+diluted by the rules that were easy to write. Rules rank by evidence, the tail
+is dropped, and the block states how many were dropped and where to read them.
+A file that truncates in silence reads as the whole of what a repository
+decided.
+
+This repository's block is six rules and 17 lines, so the budget is not binding
+yet and the guard is a synthetic 200-rule report rather than a live one. Five
+mutations were run against it: removing the budget, dropping rules silently,
+clobbering the text above the block, clobbering the text below it, and guessing
+at a half-written marker pair. All five turn a test red.
+
+One defect the dogfood found. `nitpick standards` loaded and validated the whole
+configuration to read one block, so a `models:` section it never reads decided
+whether it ran, and `make agents` failed on a machine whose model configuration
+was mid-edit. It reads the `standards:` block alone now, and validates that.
+"No model is called" was a claim about credentials; it has to also be a claim
+about whether the command starts.
+
+### The tool found three defects in the feature that measures the tool (2026-09-10)
+
+`nitpick review` over this branch returned three warnings, all real, and the
+most useful of them is one the branch's own tests could not have caught.
+
+`ReadTree` dropped every file whose language no probe reads before `Measure`
+saw it, so `Report.Unprobed` was unreachable from any real run and the report
+was silent about the languages it had not read. That is the failure the field
+exists to prevent, docs/measurement.md Rule 10, shipped inside the change that
+cites the rule. `TestAnUnprobedLanguageIsNamed` passed throughout because it
+builds its own file list and never touches the reading path. A guard that
+avoids the production path guards the fixture. The new test goes through
+`ReadTree`, and the real report names seven unprobed languages the reader can
+now see.
+
+The doc-comment probe read `/* Alpha does a thing. */` as one token beginning
+with a slash, so every declaration documented in the block form counted as a
+violation. This repository writes `//` throughout, so its own share was
+unaffected and nothing here would ever have shown it: a fourth denominator
+error, found only because a reviewer read the code rather than the number.
+
+`readAtBase` treated every failed read as "the base does not have this file".
+Absent and unreadable are opposite facts that look identical at the call site,
+and conflating them let a transient git error compute the base's share over a
+subset with nothing saying so. Which files the base lacks now comes from the
+diff, where git already said it, and any other failure stops the command.
+
+All three are fixed with a guard each, and each guard was mutated red. The
+count that matters: four denominator or silence bugs in one feature, three
+found by tools and one by a reviewer, none by the feature's own first draft of
+its tests.
+
+### Two reviewers found what four tools and one dogfood had not (2026-09-10)
+
+`nitpick review` over this branch found three defects and both review agents
+found six more. Every one is a variant of the same two failures this package was
+written about: a denominator that counts the wrong sites, and a claim that says
+more than its measurement.
+
+**The doc-comment probe counted interface adapters.** `func (d *dryRunProvider)
+Name() string` has an exported identifier on an unexported receiver, so godoc
+renders nothing for it and Go documents the interface rather than the adapter.
+All 37 violations this probe reported on its own repository were of that shape:
+37 false positives and no true ones. Corrected, this tree reads 683/683. Across
+five external repositories the reviewer measured, the correction moved
+kubernetes/client-go from 81.5% contested to 86.7% standard, which is the
+difference between telling a maintainer their convention is not one and
+recognising it. That is a fifth reading of the same question, in the same
+direction as the four before it.
+
+**`go-ctx-first-arg` published a rule it never measured.** Its text said "named
+ctx" and its sites function computed `at == 0` and nothing else, so a repository
+naming the parameter `c` everywhere would have been handed a fabricated
+convention carrying a real denominator. The rule now says only what the count
+covers. Whether the parameter is called ctx is a second claim and wants a second
+probe with its own number.
+
+**The base seam leaked in the deletion and rename directions.** The base file
+list was a walk of the working tree read at the base revision, so a file the
+change deleted was never asked about. A reviewer demonstrated a branch deleting
+the counterevidence for a convention, watching the tool report the convention as
+a standard the base never held, and then issuing a finding against the author
+under it. The guard for this seam existed and covered only file addition: it
+passed against the bug it named. The base list now comes from `git ls-tree` at
+the base, which also fixes a hard failure that made `-base` unusable for anybody
+with an untracked `.go` file in their tree, and the guard covers deletion,
+rename and the untracked case.
+
+**`go-error-wrap` read 200/200 because its population was idiomatic by
+construction.** It admitted only a bare identifier named `err`, and a bare `err`
+in Go almost only appears in `if err != nil { return fmt.Errorf("...: %w", err) }`.
+The spellings where a forgotten wrap hides, an error in `e` or `cause`, one
+pulled from a slice, one returned inline, were invisible. It now reads
+selectors and `Error()` calls too, and the probe's doc states the population it
+can see, because 200/200 means 200 calls this naming could read rather than 200
+wrapping decisions audited.
+
+**Three functions the previous entry cites as fixes had no coverage at all.**
+`runStandards`, `loadStandardsConfig` and `writeAgents` were at 0.0%: the
+config-scope fix recorded above as the dogfood's headline defect was guarded by
+nothing, and reverting it left the suite green. So was `writeAgents`, which is
+what CI's `make agents` runs. And a test asserting on a `.nitpick.yaml` called a
+function that never loads config, so replacing that file with one disabling the
+probe under test left it passing.
+
+**The gated file churned on every pull request.** The block carried exact counts,
+so adding one test function moved a line and `git diff --exit-code` failed for a
+number no reader can use. The evidence is banded now, `98%+ of 1000+ places`
+rather than `1181/1205`. Adding a test leaves the file byte-identical, and the
+band still falls when the share does, which is the only property worth keeping.
+The exact counts stay one command away.
+
+**A retired rule left in silence.** `make agents` measures HEAD, so a change
+taking a probe under the floor deletes its rule and CI passes because the author
+regenerated. Silent retirement was the design; it is also how a convention
+erodes with a green build over it. The block names what has sites and no longer
+clears the floor.
+
+Smaller: `220/221` printed as `100%`, which is the one rounding a tool whose
+claim is checkable counts cannot afford; `testing.TB` helpers were invisible to
+the helper probe and are usually the more disciplined ones; `testdata` was
+measured, which asks whether a repository's deliberately-wrong fixtures follow
+its conventions; and `-agents` with `-base` would have written the base
+revision's standards into the working tree's AGENTS.md and passed the drift gate
+doing it.
+
+The count for this feature: eleven denominator or overclaim defects, one found
+by its own first draft of its tests. The instrument works; it needed four
+readers to point it at itself.
+
+### The measured conventions reach the reviewer (2026-09-10)
+
+`review.standards: true` renders the standards measured at the base revision
+into the review prompt, beside the knowledge entries and after the diff. The two
+are deliberately alike and differ in their citation: a knowledge entry cites a
+source outside the tree, and a rule here cites a count over the tree, so a
+reader who doubts it can recount it. That is why the share travels with every
+rule rather than the rule alone.
+
+Off by default, and it should stay off until a measurement says otherwise. The
+argument against it is the argument already written for `review.knowledge`:
+reference material beside a diff is a reason for a model to report the
+reference, and a reviewer that turns a house convention into a finding on every
+departure is worse than one that never heard of it. The prompt says so in as
+many words, and only rules that cleared the floor are offered, routed by class
+so a style convention never reaches the defect pass.
+
+The measurement is of the base revision, read through git in a local checkout.
+Without a checkout it is skipped with a reason rather than run against the
+working tree, because reference material is the one place a measurement lands in
+front of the model rather than in a report, and a change that rewrote a
+package's style would otherwise be told the repository has always written it
+that way. Off, skipped and active-with-nothing-found all render as the same
+absent section, so the report carries which of the three happened.
+
+Two defects in this stage, both in the guard rather than the feature. The engine
+scan accepted only the field set in a struct literal, so it reported the one
+caller that wires the measurement the way `Knowledge` is wired and passed the
+ones that do not. And it carried an exemption for `fullreview.go`, which builds
+through `newEngine` and is covered rather than excused: an exemption the scan
+never reaches is a claim nobody checks, which the policy scan beside it learned
+the same way. Five mutations were run against the stage and all five turn a test
+red.
+
+One thing worth recording as a cost rather than a feature. Reading a whole tree
+to measure it is affordable over a clone and is thousands of requests over an
+API, so this needs the checkout the Action always has. A reviewer running
+against a forge with no clone gets a skip and a reason, which is honest and is
+also less than the feature promises.
+
+### The analyzers become the instrument (2026-09-10)
+
+Six hand-written Go AST probes were the first instrument. Planting one violation
+per probe and running golangci-lint over the same file showed five of the six
+restating linters that already exist: `revive exported`, which this repository
+has had enabled the whole time, plus `errorlint errorf`, `revive
+context-as-argument`, `thelper` and `nakedret`. Only `go-test-name-sentence` has
+no linter equivalent. Writing more probes means reimplementing mature tools one
+language at a time, and `internal/linters` already carries 37 of them.
+
+So the analyzers are the instrument now and this package is what turns their
+output into something retirable. `Source`, `Observation` and `Coverage` are the
+whole interface, and a source can be a linter, a prose scan, an AST probe or a
+model without the arithmetic downstream being able to tell.
+
+A linter reports violations and never says out of what, so the denominator is
+the files it read. That is coarser than a site count and the floor moves with
+it: 95% of files clean over 12 covered files, against 85% over 12 sites. A file
+is a coarse unit and most files touch most rules zero times, so file shares sit
+near the top of the range, and at 85% nearly every rule any analyzer offers
+would be called a standard.
+
+Three things this measured on its own account, in one afternoon.
+
+**The shipped analyzer config measures defects, not conventions.**
+`internal/linters/golangci.yml` pins `default: standard`, which is errcheck,
+govet, ineffassign, staticcheck and unused. Over this tree it reports nothing,
+correctly, and a conformity report built on it is six rules of silence. The
+rules that express a convention are exactly the ones a review must not run,
+because a review posts comments and a conformity scan only counts. A conventions
+ruleset, separate from the review's, is the next piece of work and is not in
+this change.
+
+**A relative root silently measured nothing.** The runners resolve Go modules
+against the repository root, and passing `.` found no module, so every analyzer
+reported having run over zero targets. Absolute now.
+
+**And the defect this package exists to prevent, shipped again.** The first
+version set `Coverage.Ran` unconditionally and counted every file an enabled
+analyzer claims. On this machine `GOTOOLCHAIN=local` pins a go older than go.mod
+asks for, golangci-lint loads no packages, exits, and reports nothing: that
+version would have published the whole repository as conforming on the strength
+of an analyzer that never looked at it. Coverage is read back from the
+analyzers' own statuses now, and a tool that did not run contributes none of its
+files. The guard that names it passed against the bug at first, because its
+fixture gave the absent source no observations and a source with no observations
+contributes no denominator whatever the code does.
+
+Correcting it changed a verdict, which is the arithmetic doing its job: revive
+read 95.5% clean over 396 files when markdown, JSON and YAML were in its
+denominator, and 94.1% over the 290 files an analyzer read. Same
+violations, correct denominator, standard becomes contested.
+
+### A conformity ruleset, separate from the review's (2026-09-10)
+
+`internal/linters/golangci.yml` pins `default: standard`, and over this tree it
+reports nothing. That is correct for a review and useless for a measurement: the
+standard set finds defects, and a review posts a comment for each one, so a
+noisy rule costs a reader's attention on a pull request.
+
+A conformity scan posts nothing and asks a different question, so it reads a
+different ruleset. `golangci-conventions.yml` adds revive with six named rules,
+errorlint, thelper, nakedret, gocritic and misspell. Over the same 292 files
+that produced zero observations, it produces 21 across four rules, and the
+spread is the signal: errcheck, revive and thelper at 99.3% clean, gocritic at
+97.9%. An operator who named their own config keeps it, because that is policy.
+
+### Four site definitions for one convention, and none of them shippable (2026-09-10)
+
+`nitpick standards` was pointed at this repository's constructor habits, and the
+denominator was the whole disagreement four times over. Every exported struct:
+10/167. Plus unexported fields: 6/22. Plus methods: 6/20. A collaborator
+discriminator built from the field types: it disagreed with a hand-labelled set
+on 5 of 20, calling `evals.Aggregate`, `Meter`, `Price` and `llm.Roles`
+collaborators and `review.Engine` a value.
+
+The reading that holds is in issue #105 and came from looking at the split
+rather than from another guess: the six types with constructors are all
+collaborators, the fourteen without divide into nine value types nobody would
+give one and five genuine collaborators, two of which already have `Build*`
+builders. The convention is 6/11, not 6/20.
+
+What that establishes is not a probe. It is that the site definition IS the
+convention, so choosing one is choosing which claim to test, and a probe whose
+sites disagree with a person's labels is measuring a different rule than the one
+it names. None of the four shipped, and the fourth was deleted rather than
+committed with a number nobody believes.
+## Removal-only edits reached neither review nor publication (2026-09-09)
+
+Planning required an added line, and finding placement snapped only to added
+lines. A change that deleted a guard without adding anything was skipped
+entirely. Three regression tests reproduced the failure: anchor resolution,
+planner admission, and an end-to-end scripted review through publication.
+
+`CommentableLines` now includes surviving context immediately beside a
+removal-only edit block. Added-line detection remains separate, and a
+replacement keeps its added-line anchors. Tests cover start/end removals,
+separate additions and removals, shared boundaries, unchanged content, and
+removals without surviving context.
+
+A live synthetic check used a Go division helper with two identical zero-divisor
+guards. Removing both guards was skipped by the v2.0.0 source binary; the updated
+binary reported the resulting panic instead of `ErrZero` in 9.57 seconds. Removing
+only the redundant guard was reviewed without findings in 4.20 seconds.
+GLM-5.3-Flash reviewed through OpenRouter Baseten fp8, Qwen3.8-27b triaged through
+Parasail fp8, with Voyage Code 4 retrieval, low reasoning, and linters off.
+The clean control recovered from two provider retries. This single bug/control
+check establishes coverage of that edit shape, not general recall.
+
+`go test ./...` passed. A subsequent model review read all six implementation
+and test files and returned no findings; that is not proof of correctness.
+Whole-file deletions and zero-context removals still require old-file anchor
+support throughout the finding pipeline.
+
+### The snap radius now reaches unchanged code (2026-09-09)
+
+`NearestCommentableLine` snapped to added lines, so a finding placed on
+unchanged code was dropped unless an added line sat within `snapDistance`. It
+now snaps to `CommentableLines`, which includes surviving context beside a
+removal-only block, so in any file carrying such a block the set of lines a
+stray finding can be rescued onto is larger than it was. That is the same
+mechanism that publishes the removed-guard finding; there is no version of this
+change that widens one without the other.
+
+The evidence for the cost is one control: removing only the redundant guard was
+reviewed and returned nothing. One clean fixture is a check that the widening
+does not obviously fire, not a precision number, and it is reported that way
+above.
+
+Accepted unmeasured, with the reason stated: the corpus plants defects in added
+and modified code, so it has no removal-only fixture to measure precision
+against, and the number this instrument would report would be about a shape the
+corpus does not contain. Building those fixtures is the measurement, and it is
+worth more than a figure derived from the ones already there.
+
+Kill condition, so the acceptance expires rather than becoming the record: if
+the corpus has not gained at least two removal-only fixtures, one planting a
+defect the removal causes and one clean, by the release after the one carrying
+this branch, then `CommentableLines` is narrowed to the immediately following
+context line only, halving the widening, and this note says the narrowing was
+taken for want of a measurement rather than because it was the better anchor.
+
+A second reader should also know what was not touched. `IsChangedLine` still
+means added, so `linters.only_changed_lines` and the linter file skip at
+`internal/linters/linters.go:684` continue to ignore removal-only files. That
+is deliberate: a linter finding on a line the change did not write is
+pre-existing, and the argument for publishing it is not the argument this
+section makes.
+
+### Repository standards become a CI gate (2026-09-11)
+
+`nitpick repo-standards -check -json` on `4f36b0c` exited 1 with 27 probe
+exceptions and 22 linter observations. After the cleanup in this change, the
+same command exits 0. Both runs used Go 1.25.5, golangci-lint 2.8.0 and the
+embedded convention ruleset over 302 Go files; neither used a model.
+
+| Probe | Before: conforming / sites | After: conforming / sites |
+|---|---:|---:|
+| Exported comment names | 720 / 720 | 720 / 720 |
+| Error wrapping | 206 / 206 | 206 / 206 |
+| Context first | 245 / 246 | 246 / 246 |
+| Explicit named returns | 49 / 51 | 51 / 51 |
+| Test names | 1237 / 1261 | 1261 / 1261 |
+| Helper markers | 137 / 137 | 138 / 138 |
+
+Linter observations fell from 22 to zero. These were convention departures,
+not 22 confirmed defects. One observation is deliberately suppressed at its
+source: the credit-limit retry fixture preserves the provider's capitalized,
+punctuated error text. The added named helper takes the helper denominator
+from 137 to 138; anonymous callbacks are checked by the linter, not that probe.
+
+CI runs the standards command after ordinary lint, using the same pinned
+analyzer and toolchain. The probes cover Go only, and analyzer file coverage
+does not prove that every build tag was checked. Eval-tag compilation remains
+a separate vet gate. The thresholds describe the current tree, so a broad
+convention change can alter which rules qualify as established standards.
+
+### Standards probes for four more languages (2026-09-11)
+
+Eight lexical probes add Python function/class naming, JavaScript class naming
+and strict equality, Java type/package naming, and Ruby method/type naming.
+They use Chroma 2.27.0 without a language runtime; external linters validate
+syntax and supply separate observations. TypeScript remains unprobed.
+
+The integration test runs four bad/clean fixture pairs against Ruff 0.16.1,
+ESLint 10.8.0, PMD 7.27.0, and RuboCop 1.81.7. Each bad fixture must report both
+of its target rules, and each clean fixture must report zero observations with
+nonempty coverage. Project configurations that disable rules accompany the
+fixtures. All four pairs passed locally; CI requires the tools to be present.
+This verifies those rules and their configuration isolation, not precision on
+production repositories.
+
+The lexical controls exclude comments, strings, Ruby heredoc bodies, and JSX
+text while retaining JSX expressions. One Ruby namespace fixture initially
+returned the expected conforming/total count while identifying the wrong
+declaration. It now asserts the violating line as well as the count. This is
+why a correct numerator and denominator alone do not establish correct sites.
+
+These probes do not validate complete language grammars. Lexer errors, Java
+Unicode escapes, and unsupported Ruby heredoc forms are reported as unmeasured;
+`repo-standards -check` exits 2 and `agents` refuses to regenerate from that
+measurement. Ruby heredoc interpolation is outside the probe denominator.
+
+Review exposed ambiguity between Ruby append expressions and heredoc openers.
+Regression controls cover three append spacing forms. Unterminated `<<` and
+`<<-` arguments can still be counted lexically; a real RuboCop integration
+control requires syntax findings for those forms and `<<~`. This limits the
+probe-only measurement: it does not establish syntactic validity.
+
+
+## Engineering profile development controls (2026-09-11)
+
+The first lifecycle trial used Synthetic `hf:moonshotai/Kimi-K3` for review and
+validation and `hf:zai-org/GLM-5.3-Flash` for triage. It retained one finding:
+`Put` could write to a nil map before `Configure`. It did not report the misleading
+readiness comment. The corrected clean control completed both analyzer targets
+and all three selected slop/design targets with zero findings. The fixture sources
+are in [the lifecycle controls](../internal/practices/testdata/lifecycle/README.md).
+Those initial single runs did not establish precision. Repeated controls below
+record adverse results as well as detections.
+
+An earlier attempted clean control was not clean: its entry point discarded the
+cache it created. The model identified that consequence. The same run also asserted
+that valid provider model identifiers did not exist; an expert marked that claim
+unresolved. The engineering adapter initially lost the expert's uncertainty. It
+now retains uncertainty and withheld decisions, and unresolved claims cannot be
+promoted to blocking findings. The rerun selected the code fixture without its
+provider configuration, so its zero findings do not validate model-catalog claims.
+
+That trial also found an applicability bug: a skipped Python analyzer made a
+Go-only assessment incomplete. Coverage now requires input claims before a
+skipped analyzer can count as missing work. Its control retains failure when the
+skipped analyzer has an applicable input.
+
+Twelve targeted mutations were killed by their named guard tests: inheriting a
+parent module after malformed nested metadata, counting a source snapshot as an
+assessment, omitting review-policy validation, labeling analyzer output as model
+evidence, dropping accepted-base convention standing, replacing accepted analyzer
+settings, reversing the source-consistency check, restoring captured configuration
+in the assessment callback, omitting required boundary placeholders, withholding
+routes until after assessment, dropping analyzer globs, and accepting unknown
+configuration blocks. This is a bounded mutation
+audit, not a mutation score for the repository.
+
+
+Three paired lifecycle repeats with prompt `engineering-1` selected slop and
+design only, with the same external policy and three examined files per run.
+Every bad run retained the false readiness comment and nil-map lifecycle claim.
+The clean fixture produced design output in all three repeats: zero-value cache
+behavior, a request for a status-key constant, and an objection to the constructor's
+name. The last two are style preferences rather than demonstrated design defects.
+One bad-run expert could not resolve the lifecycle claim with its supplied context.
+
+| Repeat | Bad seconds | Bad slop/design findings | Clean seconds | Clean slop/design findings |
+| --- | ---: | --- | ---: | --- |
+| 1 | 65.87 | 1 / 1 | 72.01 | 0 / 2 |
+| 2 | 88.83 | 1 / 2 | 67.81 | 0 / 1 |
+| 3 | 47.04 | 1 / 1 | 69.68 | 0 / 1 |
+
+These retained model outputs are not independently adjudicated precision counts.
+They do not support blocking on design findings. Prompt `engineering-2` removes
+the separate pedantic style pass, retains style output as advisory signals, and
+requires evidence for external API/catalog claims. Usage metering now records
+provider-reported tokens and calls, including missing usage and failed calls;
+SDK-hidden retries make those counts a lower bound. No dollar cost is inferred.
+
+
+Three paired `engineering-2` lifecycle runs retained the initialization defect
+in every bad case. Clean cases returned zero, one and one findings: the latter
+two questioned whether the exported cache supports its zero value. That remains
+an API-contract concern rather than proof the constructor-based design is wrong.
+The third bad run hit a provider concurrency limit during expert validation;
+the pre-fix report incorrectly marked both model checks completed. This run is
+not valid completed coverage. The failure led to a regression that makes failed
+expert validation a recorded incomplete stage while preserving its finding.
+
+| Repeat | Bad seconds | Bad input/output tokens | Clean seconds | Clean input/output tokens |
+| --- | ---: | --- | ---: | --- |
+| 1 | 136.25 | 8,950 / 6,703 | 5.72 | 1,233 / 197 |
+| 2 | 78.27 | 3,008 / 4,913 | 31.83 | 3,188 / 1,824 |
+| 3 (bad validation failed) | 111.53 | 4,333 / 5,235 | 81.78 | 2,442 / 4,481 |
+
+These are provider-reported prompt/completion tokens, with cache tokens recorded
+separately in the [measurement artifact](../notes/engineering-control-results.json).
+Hidden provider retries may cost more. Latencies include shared-provider contention;
+they are not a throughput benchmark.
+
+A separate [failure-propagation pair](../internal/practices/testdata/failure-propagation/README.md)
+completed three targets per check with prompt `engineering-2`. The bad helper's
+swallowed serialization/write errors were retained as one slop finding (74.25 s,
+4,495 input / 3,622 output tokens). The good helper returned encoder errors through
+the caller and produced zero findings (23.68 s, 1,153 / 1,012 tokens). Findings can
+land in slop or design because the engine preserves the selected defect class;
+this pair demonstrates one lost-failure mechanism, not comprehensive design recall.
+
+
+Four further mutations were killed by the intended assertions: dropping expert
+failure stages, dropping duplicate-check detection, overwriting an existing
+snapshot during capture, and omitting practices from full configuration
+validation. The duplicate-check control requires a substantive assessment
+before duplication. These controls establish those four guards, not general test quality.
+
+The subsequent deterministic self-assessment examined 332 convention/analyzer
+file targets and found zero violations. It examined 584 text targets, retained
+246 advisory prose tells, excluded fourteen inputs, and omitted none from the
+snapshot. The selected one-commit range conformed. Slop and design model checks
+were deliberately disabled and reported unavailable; no explicit import boundary
+was configured. The overall engineering profile therefore exited 2. These counts
+establish deterministic coverage for that worktree, not complete internal
+best-practice compliance or a clean semantic-slop assessment.
+
+That assessment identified its source as `worktree:sha256:4cefb4d6712de813395a8c6f073f4ae95a808a29d28332ac135f0329a078d3bd`
+and accepted policy as `70a43ac107f6bcb4a3e25bb6e6840adf0f3544af9244946cba1854efbeb25376`.
+
+Five later mutations were also killed by their intended guards: erasing a
+reasonless unresolved verdict, undercounting an outage, losing omissions on a
+second captured-tree diff, rejecting a deletion-only source scope, and hiding a
+failed stage behind empty-scope inapplicability. The deletion-only control requires
+one examined commit and zero model targets; it does not call an unexecuted model
+assessment completed.
+
+
+The internal-adoption boundary control used a temporary module named
+`github.com/jdziat/open-nitpick` and one tracked source file at
+`internal/commits/subject.go`. Under the proposed repository policy, the
+blank import `strings` completed the boundary check over one source with zero
+findings; replacing it with `net/http` completed the same check with one blocking
+finding. Models and linters were disabled for this control, so this establishes
+only direct-import matching. It does not establish full engineering completion.
+The four-file adoption diff passed a Nitpick review with zero findings, a
+deterministic slop scan with zero tells, and actionlint 1.7.7.
+
+The adoption checkpoint passed its deterministic engineering gate.
+Convention and analyzer checks each examined 333 file targets with zero findings.
+The two direct-import boundaries examined 331 Go sources with zero violations.
+The text scan examined 585 targets and retained 245 advisory tells; the snapshot
+omitted none. `-base HEAD` selected an explicitly empty commit range; commit
+validation was checked separately by the CI wrapper. Model slop and design were
+disabled and reported unavailable, as optional checks under this policy. Exit 0
+means the selected deterministic requirements passed, not that semantic slop
+or design quality was assessed.
+
+Source: `worktree:sha256:b24d876d03c1a3da647aa8776c83c67e049a74cedb261e33fc743b067141cc28`.
+Policy: `ac17759ea7ff4c528645ebc521f637d5ac35b1d3eaa5ff068cfbe5a575ca38da`.
+
+
+A subsequent audit of the three merged engineering PRs found one nonconforming
+subject: `e0443bd`, “Record engineering policy and check coverage (#113)”.
+The branch commits passed CI, but that job did not inspect the PR title used
+for the squash commit. Title validation existed in `nitpick commits -title`
+and as an opt-in practice; the adopted required checks did not select it.
+CI now passes the PR title to the shared validator and handles title-edit
+events. The historical commit remains visible as a violation.
+
+The live control on PR #116 changed only its proposed title.
+[Run 34656113186](https://github.com/jdziat/open-nitpick/actions/runs/34656113186)
+rejected the invalid title with `commits.subject-format`;
+[run 34656158969](https://github.com/jdziat/open-nitpick/actions/runs/34656158969)
+passed after the valid title was restored on the same commit. Those edits
+started two commit-policy runs and no new main CI run.
+
+## Security persona bake-off (2026-09-18)
+
+Which chat model should drive `nitpick security`'s optional model pass.
+
+**Instrument.** `make eval-security`: `NITPICK_EVAL_SECURITY=1` applies the
+same instruction the command injects (`internal/security.Instruction`). Corpus
+is seven security-class plants plus `clean-refactor` and `style-only` (Rule 10
+silence). Eight contenders, two runs each, with and without related context, one
+within-run table (Rule 2). Linters off so the score is the model. Harness limit:
+review and triage are the same weights (not the shipped luna+glm pairing).
+
+**Dump.** `internal/evals/.eval-runs/multifile-mixed-20260918T125032Z-2476545.jsonl`.
+
+**Tuning (shared coverage, every row 18 reviews, 0 lost):**
+
+| contender | RECALL | NOISE | $/REVIEW | $/LOCATED |
+|---|---:|---:|---:|---:|
+| z-ai/glm-5.3-flash +ctx | 0.83 | 0.06 | $0.0016 | $0.0020 |
+| anthropic/claude-opus-5 | 0.78 | 0.06 | $0.1383 | $0.1778 |
+| anthropic/claude-sonnet-4.6 +ctx | 0.72 | 0.00 | $0.0186 | $0.0258 |
+| openai/gpt-5.6-luna | 0.72 | 0.00 | $0.0003 | $0.0004 |
+| anthropic/claude-opus-5 +ctx | 0.72 | 0.06 | $0.0458 | $0.0635 |
+| google/gemini-3.5-flash (+ctx same) | 0.67 | 0.00 | ~$0.02 | ~$0.03 |
+| openai/gpt-5.6-luna +ctx | 0.67 | 0.11 | $0.0003 | $0.0004 |
+| openai/gpt-5.6-terra (±ctx) | 0.61 | 0.06 | ~$0.002 | ~$0.003 |
+| moonshotai/kimi-k2.7-code | 0.39–0.50 | 0.06 | ~$0.006 | ~$0.01–0.015 |
+
+Silence controls stayed clean for every contender. `php-forbidden-vs-404` (info
+band) and `multi-defect` were the main separators.
+
+**Held-out spend (once):** `removed-guard`, `bash-fixed-temp-path`,
+`clean-sql-allowlist`: three fixtures, top contenders only.
+
+| contender | RECALL | NOISE | $/REVIEW |
+|---|---:|---:|---:|
+| openai/gpt-5.6-luna (±ctx) | 1.00 | 0.00 | ~$0.0004 |
+| anthropic/claude-sonnet-4.6 (±ctx) | 1.00 | 0.00 | ~$0.18 |
+| z-ai/glm-5.3-flash | 1.00 | 0.00 | $0.0011 |
+| z-ai/glm-5.3-flash +ctx | 0.75 | 0.00 | $0.0011 |
+
+glm's tuning lead did not hold under +ctx on held-out (missed one
+`removed-guard` run). luna and sonnet stayed perfect; luna is ~400× cheaper than
+sonnet on that spend.
+
+**Call.** Pin `models.security` to `openai/gpt-5.6-luna` (done in
+`.nitpick.openrouter.yaml`). Leave `models.review` as luna for PR review; the
+security role exists so a later bake-off can diverge without forcing every
+review onto security-tuned weights. Rule 8: single-file/multifile fixtures are
+not PRs; this ranks the security *persona* on planted defects, not tree-scan
+completeness (scanners are separate).
+
+## Hard security corpus (2026-09-18)
+
+The bake-off above hit RECALL 1.00 on held-out because that spend was only two
+plants plus one silence. Under Rule 7 those three fixtures
+(`removed-guard`, `bash-fixed-temp-path`, `clean-sql-allowlist`) are **spent**
+for security-persona generalization and must not be re-spent as
+`SECURITY_HELD_OUT`.
+
+**Tuning (`make eval-security`, `SECURITY`):** easy sinks, medium plants,
+promoted spent hard plants, `go-idor-wrong-principal` (authz present, wrong
+principal), silence including `clean-sql-allowlist` and
+`php-clean-404-on-forbidden`. Goal: RECALL 1.00 should be rare on tuning alone.
+
+**Fresh held-out (`make eval-security-heldout`, `SECURITY_HELD_OUT`, spend once):**
+`python-expired-token-accepted`, `python-hmac-unbound-compare`,
+`python-hmac-bound-clean`. Distinct from global `HELD_OUT`.
+
+Do not treat the 2026-09-18 three-fixture held-out 1.00 as the bar for the next
+model pick.
+
+**Smoke (tuning only, before any held-out spend):**
+`make eval-security MODELS=z-ai/glm-5.3-flash RUNS=1` gives RECALL **0.83**
+(no ctx) / **0.92** (+ctx). Misses without ctx: `removed-guard`, one plant in
+`multi-defect`. Not 1.00; corpus is hard enough to rank without spending
+`SECURITY_HELD_OUT` yet.
+
+**Label check (2026-09-19):** that smoke's header said MIXED (10 tuning + 3
+held-out + 1 multi-file) because `removed-guard`, `bash-fixed-temp-path`, and
+`clean-sql-allowlist` are still in global `HeldOutFixtures`. The security
+battery is now labeled `SECURITY tuning` and the dump token is `security`,
+not `mixed`. A one-fixture subset does not inherit that label.
+
+**Pinned-model check, same corpus, RUNS=1, held-out not spent:**
+`make eval-security MODELS=openai/gpt-5.6-luna RUNS=1` gives RECALL **0.75** /
+**0.83** (+ctx). Header: `SECURITY tuning corpus (14 fixture(s))`. Silence
+stayed silent (`clean-refactor`, `style-only`, `clean-sql-allowlist`,
+`php-clean-404-on-forbidden` all 0/0). `go-idor-wrong-principal` was located
+both ways. Under the then-unscoped scorer, `multi-defect` was 1/3 because the
+race and descriptor leak are not `ClassSecurity` and
+`security.Instruction` forbids reporting them.
+
+**Persona scoring layer (keep `multi-defect`):** under `NITPICK_EVAL_SECURITY`,
+`ScoreDetectionForEval` / `ScoreSeverityForEval` count only `ClassSecurity`
+plants. Findings that match a non-security plant on the same fixture are out
+of scope (not noise). Raw `ScoreDetection` stays unscoped for non-security
+batteries.
+
+**Re-score of the luna dump with that layer (no new spend):**
+`NITPICK_EVAL_SECURITY=1` over
+`multifile-security-20260919T011046Z-500927.jsonl` gives luna **9/10** (0.90),
+luna +ctx **10/10** (1.00). The old 0.75/0.83 was the unscoped denominator.
+
+**Live end-to-end with the layer (2026-09-19):**
+`make eval-security MODELS=openai/gpt-5.6-luna RUNS=1` gives RECALL **0.90** /
+**1.00** (+ctx); `multi-defect` **1/1** (not 1/3); severity error band **2/2**
+(not 2/4); header `SECURITY tuning`. Matches the dump re-score. With +ctx
+already at 1.00 on tuning, do not spend `SECURITY_HELD_OUT` to pick a model
+until a ranking that is not already saturated exists (harder plants, or rank
+the no-ctx arm).
+
+## Security prompt depth A/B (2026-09-19)
+
+Does luna vs glm-5.3-flash move with light / deep / extreme security prompts?
+Tuning corpus, RUNS=1, persona scoring on, held-out not spent.
+`DEPTH=` selects `NITPICK_EVAL_SECURITY_DEPTH` (`InstructionLight` / shipped
+`Instruction` / `InstructionExtreme`). Eval-only; shipped `nitpick security`
+still uses `Instruction` (deep).
+
+| depth | luna | luna +ctx | glm | glm +ctx |
+|---|---:|---:|---:|---:|
+| light | 0.90 / 0.00 | 0.70 / 0.07 | 0.90 / 0.00 | 0.90 / 0.00 |
+| deep | **1.00 / 0.00** | 0.90 / 0.07 | 0.90 / 0.14 | **1.00 / 0.07** |
+| extreme | 1.00 / **0.36** | 0.90 / 0.14 | 0.90 / 0.14 | 1.00 / **0.21** |
+
+Cells are RECALL / NOISE. Fixture signal: light left `php-forbidden-vs-404`
+at 0/1 for every arm; deep/extreme recovered it on some arms. Extreme put
+`+1n` on `php-clean-404-on-forbidden` for every arm (the silence twin). Luna
+no-ctx is already perfect and silent on deep; extreme adds noise without
+recall. Call: keep shipped depth at deep; do not promote extreme.
+
+## Full-review health pass (2026-09-19)
+
+Branch `chore/full-review-health`. First pass: `nitpick repo-score -budget 120000
+cmd internal` (raw report:
+`docs/full-review-health-2026-09-19-cmd-internal.txt`).
+
+**Coverage:** 30 of 50 files in the budget window answered; 20 model-batch
+failures (not silence); 481 files past the budget. Rates below are over the
+answered files only.
+
+**Score (weighted findings / 1k lines; critical 8, error 4, warning 2, info 1):**
+
+| language | files | lines | slop | bugs | security |
+|---|---:|---:|---:|---:|---:|
+| go | 29 | 7548 | 0.26 | 6.09 | 0.00 |
+| all | 30 | 7594 | 0.26 | 6.06 | 0.00 |
+
+26 findings: 2 error, 16 warning, 8 info. No security class hits in the window.
+Slop under the 2.0 / 1k threshold.
+
+**Remediation on this branch:** nil `cfg` in `engineeringReviewPolicy`; practices digest marshal; nil tree/report on `securityScan`; empty benchrepo titles; discarded manifest marshal; `prNumbers` refuses a 1000-cap truncation; drifted files are omitted from measurement; `improve` reads the prior review before the model pass and fails closed when that read errors; `security.Failed` is independent of roster completeness; `init` walk honors cancellation and a chmod failure no longer drops a validated config; workflow-overwrite and whole-tree standards tests now fail if the guard they name is deleted; `captureStdout` joins its reader on cleanup so a panic inside the test cannot leak the pipe.
+
+**Left as designed:** publish failure stays a warning so a fork PR is still gated (`review.go`); respond re-parses the mention against resolved policy on purpose; `designContextFiles` returns problems, not a discarded error; `wired` only rejects a literal `nil` suffix because the enginewiring guard is a source scan of the form `fullreview.go` uses, not a type system. `Roles.Build` lock is blocked: `internal/llm/client.go` is claimed by another agent.
+
+**Still open:** the 20 model-batch failures and the 481 files past the 120000-token budget.
+

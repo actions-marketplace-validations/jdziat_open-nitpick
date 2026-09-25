@@ -270,6 +270,10 @@ func (l *Local) ListDir(ctx context.Context, ref Ref, dir string) ([]string, err
 // is no reason for a reviewer to follow links at all, and refusing them keeps
 // the rule easy to state.
 func (l *Local) readContained(path string) ([]byte, error) {
+	return l.readContainedLimit(path, 0)
+}
+
+func (l *Local) readContainedLimit(path string, limit int64) ([]byte, error) {
 	clean := filepath.FromSlash(strings.TrimPrefix(path, "/"))
 
 	root, err := os.OpenRoot(l.Dir)
@@ -304,6 +308,9 @@ func (l *Local) readContained(path string) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	if limit > 0 {
+		return io.ReadAll(io.LimitReader(f, limit))
+	}
 	return io.ReadAll(f)
 }
 
@@ -353,6 +360,27 @@ func (l *Local) revParse(ctx context.Context, rev string) (string, error) {
 		return "", fmt.Errorf("resolve %q: %w", rev, err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// Tree lists the repository-relative paths a revision holds.
+//
+// The revision's own file list, not the working tree's. A caller measuring
+// what a base revision looked like has to enumerate it from the base: walking
+// the working tree and reading those paths at the base makes the answer a
+// function of the change, because a file the change deleted or renamed is
+// never asked about.
+func (l *Local) Tree(ctx context.Context, rev string) ([]string, error) {
+	out, err := l.git(ctx, "ls-tree", "-r", "--name-only", "-z", rev)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
 }
 
 // git runs a git command and returns trimmed stdout.

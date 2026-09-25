@@ -11,8 +11,9 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/jdziat/open-nitpick/internal/config"
 	"strings"
+
+	"github.com/jdziat/open-nitpick/internal/config"
 
 	"github.com/jdziat/open-nitpick/internal/fullreview"
 	"github.com/jdziat/open-nitpick/internal/review"
@@ -76,6 +77,13 @@ func runTreeReview(ctx context.Context, name string, args []string, score bool) 
 	if score {
 		fmt.Print(fullreview.Score(report, tree).String())
 	}
+
+	// After the output, not instead of it. full-review and repo-score returned
+	// nil unconditionally, so a tree review whose triage died exited 0 and read
+	// as a finished score.
+	if !report.PipelineComplete() {
+		return errIncomplete
+	}
 	return nil
 }
 
@@ -94,7 +102,11 @@ func treeReview(ctx context.Context, f *reviewFlags, paths []string, budget int,
 		return nil, nil, err
 	}
 	if len(cfg.Dropped) > 0 {
-		log.Warn("ignored endpoint settings from an untrusted config file", "keys", strings.Join(cfg.Dropped, ", "))
+		log.Warn("ignored settings an untrusted config file may not supply", "keys", strings.Join(cfg.Dropped, ", "))
+	}
+	if len(cfg.Unknown) > 0 {
+		log.Warn("ignored config keys this version does not know",
+			"keys", strings.Join(cfg.Unknown, ", "), "version", version)
 	}
 
 	// A whole-tree review has already read every file, so both directions
@@ -120,7 +132,10 @@ func treeReview(ctx context.Context, f *reviewFlags, paths []string, budget int,
 	ref := vcs.Ref{Head: vcs.Worktree}
 
 	log.Info("reviewing the tree", "repo", repo, "paths", strings.Join(paths, ","), "budget", budget)
-	engine := newEngine(f, repo, cfg, tree, log)
+	engine, err := newEngine(ctx, f, repo, cfg, tree, ref, log)
+	if err != nil {
+		return nil, nil, err
+	}
 	// A pull request may not supply the policy it is reviewed under, so the
 	// engine normally re-reads .nitpick.yaml from the base revision when the
 	// change touches it. A tree review "changes" every file, that one

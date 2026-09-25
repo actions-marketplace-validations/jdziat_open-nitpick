@@ -2,40 +2,18 @@
 # README points at, so it stays readable rather than exhaustive.
 
 models:
-  # synthetic carries its endpoint in the binary (internal/llm/synthetic.go),
-  # which is why this file names no base_url and no api_key_env: both are
-  # stripped from a config the reviewer does not trust, so a default built on
-  # them would silently work for nobody but its author. Only SYNTHETIC_API_KEY
-  # is needed. Run "nitpick providers" to see every option. Kimi-K3 ties the
-  # sweep's default on recall and a flat subscription does not charge the one
-  # column it lost on; see the README's Synthetic section.
+  # Synthetic's built-in endpoint lets committed policy select models without
+  # storing credentials. Set SYNTHETIC_API_KEY in the environment or keystore.
   default:
     provider: synthetic
-    model: hf:moonshotai/Kimi-K3
-    # No max_tokens and no timeout here: unset, the model's own output
-    # maximum applies and the call has ten minutes, so a reasoning model's
-    # thinking neither truncates its answer nor times it out. Setting a
-    # lower cap is how reviews get lost, not a saving.
+    model: hf:zai-org/GLM-5.3-Flash
 
-  # Triage only merges and filters findings, so it does not need the expensive
-  # model. Splitting the roles is most of the cost saving available here.
-  # glm-5.3-flash is also the iteration model (`make quick`); docs/findings.md
-  # records how it compares as a reviewer.
   triage:
     provider: synthetic
-    model: hf:zai-org/GLM-5.3-Flash
+    model: hf:Qwen/Qwen3.8-27B
     temperature: 0
 
-  # The model that edits code on "@open-nitpick fix". There is no default for
-  # this and there should not be: every measurement in docs/findings.md scores
-  # a reviewer on recall and noise, and neither says whether a model can
-  # produce a change that compiles.
-  #
-  # So this line is a choice rather than a result, and worth naming as one.
-  # Kimi-K3 is picked because it is the model this repository already runs and
-  # is known to return correctly shaped structured output here. It has not been
-  # measured as an editor; nothing has. A fix it writes stays unverified until
-  # the checks on the pull request it opens have run.
+  # Editing quality has not been measured; fixes still require review and CI.
   fix:
     provider: synthetic
     model: hf:moonshotai/Kimi-K3
@@ -47,6 +25,10 @@ review:
   fail_on: none
   min_severity: info
   concurrency: 4
+  # A clean completed review closes its own earlier threads and submits
+  # APPROVE, so a green review check is also a green review disposition.
+  approve:
+    enabled: true
   # A million-token model can read far more than 60k tokens per request; the
   # budget is about how much one call is asked to judge at once, not what
   # the model can hold. Raised here, where the reviewer is a frontier model.
@@ -57,6 +39,14 @@ review:
   # docs/findings.md's callers section is the evidence for what it finds.
   related_context: true
   related_context_callers: true
+  ignore:
+    # Generated vectors, not source. `nitpick knowledge-index` writes them and
+    # a test checks them against the corpus, so a reviewer reading them can
+    # find nothing a person would act on. The 4096-dimension bundle is 393k
+    # tokens on its own, which is three times this file's per-request budget:
+    # it does not fail to be worth reviewing, it fails to be reviewable, and
+    # the batch that tried it failed the run.
+    - "internal/knowledge/indexes/**"
 
 instructions:
   - path: "**/*.go"
@@ -85,3 +75,22 @@ linters:
   mode: auto
   enabled: [golangci-lint]
   only_changed_lines: true
+
+practices:
+  profile: engineering
+  # Models still run in reviews; only deterministic completion gates CI.
+  required: [conventions, linters, commits, slop-tells]
+  required_conventions:
+    - go-doc-comment-name
+    - go-error-wrap
+    - go-ctx-first-arg
+    - go-no-naked-return
+    - go-test-name-sentence
+    - go-test-helper-marks
+  boundaries:
+    - from: github.com/jdziat/open-nitpick/internal/commits
+      forbid: [os/exec, net/http]
+      reason: Commit subject validation must not launch processes or make HTTP requests.
+    - from: github.com/jdziat/open-nitpick/internal/standards
+      forbid: [os/exec, net/http]
+      reason: Convention probes measure supplied source; analyzers run in internal/linters.

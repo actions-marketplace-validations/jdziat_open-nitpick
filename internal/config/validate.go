@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -23,6 +24,9 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Linters.validate()...)
 	errs = append(errs, c.Persona.validate()...)
 	errs = append(errs, c.Validation.validate()...)
+	errs = append(errs, c.Standards.Validate())
+	errs = append(errs, c.Practices.Validate())
+	errs = append(errs, c.Security.validate()...)
 
 	for i, ins := range c.Instructions {
 		if strings.TrimSpace(ins.Path) == "" {
@@ -58,6 +62,22 @@ func (m Models) validate() []error {
 		errs = append(errs, prefixAll("models.fix", m.Fix.validate(false))...)
 		if strings.TrimSpace(m.Fix.Model) == "" {
 			errs = append(errs, errors.New("models.fix: model is required"))
+		}
+	}
+	if m.Security != nil {
+		errs = append(errs, prefixAll("models.security", m.Security.validate(false))...)
+		if strings.TrimSpace(m.Security.Model) == "" {
+			errs = append(errs, errors.New("models.security: model is required"))
+		}
+	}
+	if m.Embed != nil {
+		errs = append(errs, prefixAll("models.embed", m.Embed.validate(false))...)
+		if strings.TrimSpace(m.Embed.Model) == "" {
+			errs = append(errs, errors.New("models.embed: model is required"))
+		}
+		if strings.TrimSpace(m.Embed.Provider) == "" {
+			errs = append(errs, errors.New("models.embed: provider is required; "+
+				"an embedding model does not inherit the reviewer's provider"))
 		}
 	}
 	if m.Router != nil {
@@ -162,6 +182,13 @@ func (s ModelSpec) validate(required bool) []error {
 		errs = append(errs, fmt.Errorf("unknown structured_output %q (want auto, schema, or json)", s.StructuredOutput))
 	}
 
+	switch s.Reasoning {
+	case "", ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningOff:
+	default:
+		errs = append(errs, fmt.Errorf("unknown reasoning %q (want %s)",
+			s.Reasoning, strings.Join(ReasoningLevels(), ", ")))
+	}
+
 	if s.BaseURL != "" {
 		if !strings.Contains(s.BaseURL, "://") {
 			errs = append(errs, fmt.Errorf("base_url %q must include a scheme", s.BaseURL))
@@ -189,6 +216,15 @@ func (s ModelSpec) validate(required bool) []error {
 
 func (r Review) validate() []error {
 	var errs []error
+
+	// A mention is the origin converse.Command reads the verb relative to, so
+	// a blank one anchors at the start of every comment and reads whatever
+	// word is there as the command. It is a handle that matches everything,
+	// not a handle that matches nothing.
+	if strings.TrimSpace(r.Mention) == "" {
+		errs = append(errs, errors.New("review.mention is blank; a handle that matches nothing "+
+			"anchors at the start of every comment and matches everything"))
+	}
 
 	errs = append(errs, r.Budget.validate()...)
 	errs = append(errs, r.Respond.Fix.validate()...)
@@ -317,16 +353,24 @@ func checkAnalyzerConfigPath(key, path string) error {
 }
 
 // SemgrepRegistryRef reports whether a semgrep config value names a registry
-// rule set rather than a local file. Exported so internal/linters, which
-// decides containment, and this package, which decides validity, cannot drift
-// on what counts as a path: anything that is not a registry reference has to
-// be an absolute path outside the repository, and getting that wrong in one
-// place alone lets `rules/x.yml` pass validation and then be read out of the
-// tree under review.
+// rule set rather than a local file.
+//
+// Exported so internal/linters, which decides containment, and this package,
+// which decides validity, cannot drift on what counts as a path. A shape
+// rather than a prefix, because a registry reference is returned verbatim
+// rather than resolved, so it reaches a command line with no path check.
 func SemgrepRegistryRef(ref string) bool {
-	ref = strings.TrimSpace(ref)
-	return strings.HasPrefix(ref, "p/") || strings.HasPrefix(ref, "r/")
+	return semgrepRegistry.MatchString(strings.TrimSpace(ref))
 }
+
+// semgrepRegistry matches p/<name> and r/<path>, the two forms semgrep's
+// registry takes: letters, digits and the separators a ruleset name uses, so
+// no traversal, no scheme, no whitespace and no leading dash.
+//
+// The character set is read off the references semgrep publishes rather than
+// off a grammar, because it does not publish one. It can only refuse a value
+// the old prefix test accepted, and it refuses loudly, naming the key.
+var semgrepRegistry = regexp.MustCompile(`^[pr]/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$`)
 
 // prefixAll qualifies each error with its configuration path so a validation
 // failure names the key the user has to edit.
@@ -336,4 +380,31 @@ func prefixAll(prefix string, errs []error) []error {
 		out = append(out, fmt.Errorf("%s: %w", prefix, err))
 	}
 	return out
+}
+
+// Validate checks the standards block on its own.
+//
+// Exported because `nitpick standards` reads this block without loading the
+// rest of the configuration: it calls no model, so a models section it never
+// reads should not decide whether it runs.
+//
+// A floor outside 0..1 is the mistake this catches: min_share written as 85
+// rather than 0.85 asks for a share no count can reach, and every rule the
+// repository follows then reports as contested. Silence with a
+// plausible cause is the worst kind, so it is refused at load.
+func (s Standards) Validate() error {
+	var errs []error
+	if s.MinShare < 0 || s.MinShare > 1 {
+		errs = append(errs, fmt.Errorf("standards.min_share is %v; it is a fraction between 0 and 1, "+
+			"so 85%% is 0.85 and a value above 1 is a floor no count can clear", s.MinShare))
+	}
+	if s.MinSites < 0 {
+		errs = append(errs, fmt.Errorf("standards.min_sites is %d; a count of sites cannot be negative", s.MinSites))
+	}
+	for i, id := range s.Disabled {
+		if strings.TrimSpace(id) == "" {
+			errs = append(errs, fmt.Errorf("standards.disabled[%d] is blank", i))
+		}
+	}
+	return errors.Join(errs...)
 }

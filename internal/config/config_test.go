@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeConfig writes a .nitpick.yaml into a temp repo root and returns the root.
@@ -221,7 +222,7 @@ func TestValidateAllowsFailOnNone(t *testing.T) {
 	}
 }
 
-func TestSeverityOrdering(t *testing.T) {
+func TestSeverityOrderingRespectsThresholds(t *testing.T) {
 	if !SeverityError.AtLeast(SeverityWarning) {
 		t.Error("error should outrank warning")
 	}
@@ -268,7 +269,7 @@ func TestInstructionsForMatchingPaths(t *testing.T) {
 	}
 }
 
-func TestIgnoreDefaults(t *testing.T) {
+func TestIgnoreDefaultsExcludeGeneratedDependencies(t *testing.T) {
 	cfg := Defaults()
 
 	ignored := []string{
@@ -457,3 +458,69 @@ func TestTheFixModelDoesNotFallBackToTheReviewer(t *testing.T) {
 		t.Errorf("spec = %s/%s", spec.Provider, spec.Model)
 	}
 }
+
+func TestResolveSecurityFallsBackToReviewThenDefault(t *testing.T) {
+	m := Models{Default: ModelSpec{Provider: "openai", Model: "default-model"}}
+	got := m.ResolveSecurity()
+	if got.Model != "default-model" || got.Provider != "openai" {
+		t.Errorf("unset security = %s/%s, want default", got.Provider, got.Model)
+	}
+
+	m.Review = &ModelSpec{Model: "review-model"}
+	got = m.ResolveSecurity()
+	if got.Model != "review-model" {
+		t.Errorf("security with review only = %q, want review-model", got.Model)
+	}
+
+	m.Security = &ModelSpec{Model: "security-model"}
+	got = m.ResolveSecurity()
+	if got.Model != "security-model" || got.Provider != "openai" {
+		t.Errorf("named security = %s/%s", got.Provider, got.Model)
+	}
+}
+
+func TestSecurityModelRequiresAName(t *testing.T) {
+	cfg := Defaults()
+	cfg.Models.Default = ModelSpec{Provider: "openai", Model: "m"}
+	cfg.Models.Security = &ModelSpec{}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "models.security") {
+		t.Fatalf("empty models.security: %v", err)
+	}
+}
+
+// Every request-shaping field survives the overlay.
+//
+// A field added to ModelSpec and forgotten here is set in the file, accepted by
+// the validator, and silently dropped: models.fix lost its credential keys that
+// way for a release. Read off the struct rather than listed, so the next field
+// is covered by existing.
+func TestOverlayCarriesEveryRequestShapingField(t *testing.T) {
+	base := ModelSpec{Provider: "p", Model: "m"}
+	over := ModelSpec{
+		Model:            "other",
+		Temperature:      ptrTo(0.7),
+		MaxTokens:        4096,
+		Timeout:          31 * time.Second,
+		StructuredOutput: StructuredJSON,
+		MaxRetries:       ptrTo(9),
+		Reasoning:        ReasoningHigh,
+	}
+
+	got := base.overlay(over)
+	for name, ok := range map[string]bool{
+		"Model":            got.Model == "other",
+		"Temperature":      got.Temperature != nil && *got.Temperature == 0.7,
+		"MaxTokens":        got.MaxTokens == 4096,
+		"Timeout":          got.Timeout == 31*time.Second,
+		"StructuredOutput": got.StructuredOutput == StructuredJSON,
+		"MaxRetries":       got.MaxRetries != nil && *got.MaxRetries == 9,
+		"Reasoning":        got.Reasoning == ReasoningHigh,
+	} {
+		if !ok {
+			t.Errorf("overlay dropped %s, so a role setting it is silently ignored", name)
+		}
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
