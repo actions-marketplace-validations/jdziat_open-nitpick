@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -35,12 +37,22 @@ type GitHub struct {
 	// more than 300 files; with a checkout the diff is taken from git
 	// instead, which has no such limit.
 	Checkout string
+
+	// index caches each commit's tree read from Checkout.
+	index checkoutIndex
 }
 
 // GitHubOptions configure the provider.
 type GitHubOptions struct {
 	// Token authenticates the API. Required.
 	Token string
+
+	// Installations, when set, replaces Token as the API's credential source:
+	// it mints fresh installation tokens as the current one nears expiry, so
+	// a run that outlives the hour a minted token lasts still publishes. The
+	// workflows mint one token per job, and PR #121's restart-review lost its
+	// review and every later file re-read when that hour ended mid-run.
+	Installations http.RoundTripper
 
 	// BaseURL points at a GitHub Enterprise instance. Empty uses github.com.
 	BaseURL string
@@ -64,20 +76,109 @@ const DefaultBotMarker = "<!-- open-nitpick -->"
 // that a ceiling exists, not where it sits.
 const requestTimeout = 2 * time.Minute
 
+// retryOnAbuse re-sends a request the forge refused as abuse detection.
+// Installation tokens start with an empty history, and a review's first
+// seconds fire a dozen reads plus a publish into that fresh identity,
+// which GitHub answers 429; a static token accumulates slowly enough that
+// this never fired for it, so the retry lives with the client either way.
+// The header is honored when GitHub sends one, and the backoff stays short
+// because a review run that waits minutes to publish is failing anyway.
+type retryOnAbuse struct {
+	next http.RoundTripper
+}
+
+// bearerTransport sets the Authorization header for a static token; it sits
+// under retryOnAbuse so the retry re-sends with credentials on every attempt.
+type bearerTransport struct {
+	token string
+}
+
+func (b bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// timeSleep is the clock the abuse retry waits on; tests replace it.
+var timeSleep = time.Sleep
+
+func (r *retryOnAbuse) RoundTrip(req *http.Request) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := r.next.RoundTrip(req)
+		if err == nil && resp.StatusCode != http.StatusTooManyRequests {
+			return resp, err
+		}
+		if err != nil || attempt == 2 {
+			return resp, err
+		}
+		// Drain the body so the connection returns to the pool before
+		// the retry re-uses it.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		wait := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+		if after := resp.Header.Get("Retry-After"); after != "" {
+			if secs, err := strconv.Atoi(after); err == nil && secs > 0 {
+				wait = min(wait, time.Duration(secs)*time.Second)
+			}
+		}
+		timeSleep(wait)
+	}
+}
+
 // NewGitHub builds a GitHub provider.
 func NewGitHub(opts GitHubOptions) (*GitHub, error) {
-	token := strings.TrimSpace(opts.Token)
-	if token == "" {
-		return nil, errors.New("github: a token is required (set GITHUB_TOKEN)")
-	}
+	// The credential transport is attached before NewClient because go-github
+	// copies the client it is given: a transport attached later lands on a
+	// discarded copy, which is how the retry once silently disappeared.
+	base := &http.Client{Timeout: requestTimeout}
+	var client *github.Client
+	var enterpriseURL *url.URL
 
-	client := github.NewClient(&http.Client{Timeout: requestTimeout}).WithAuthToken(token)
-
-	if base := strings.TrimSpace(opts.BaseURL); base != "" {
-		var err error
-		client, err = client.WithEnterpriseURLs(base, base)
+	if raw := strings.TrimSpace(opts.BaseURL); raw != "" {
+		parsed, err := url.Parse(raw)
 		if err != nil {
 			return nil, fmt.Errorf("github: enterprise base url: %w", err)
+		}
+		// Mirror WithEnterpriseURLs: ensure the trailing slash and the
+		// /api/v3/ suffix the API paths expect.
+		if !strings.HasSuffix(parsed.Path, "/") {
+			parsed.Path += "/"
+		}
+		if !strings.HasSuffix(parsed.Path, "/api/v3/") &&
+			!strings.HasPrefix(parsed.Host, "api.") &&
+			!strings.Contains(parsed.Host, ".api.") {
+			parsed.Path += "api/v3/"
+		}
+		enterpriseURL = parsed
+	}
+
+	if opts.Installations != nil {
+		// Self-refreshing installation credentials own the Authorization
+		// header; the transport minted the token and renews it before it
+		// expires, so no static token is required or used here.
+		base.Transport = &retryOnAbuse{next: opts.Installations}
+		client = github.NewClient(base)
+		if enterpriseURL != nil {
+			// Assigning nil would overwrite the default BaseURL that
+			// NewClient set, and the first REST call would dereference it.
+			client.BaseURL = enterpriseURL
+		}
+		// Token minting and file reads both count against the installation's
+		// 60-request-per-hour ceiling, and go-github remembers the rate
+		// response it saw. When a burst drained that ceiling, later calls
+		// were refused locally until the remembered reset time even though
+		// the token had since been renewed against fresh quota; disabling
+		// the check sends every request to the forge and lets it decide.
+		client.DisableRateLimitCheck = true
+	} else {
+		token := strings.TrimSpace(opts.Token)
+		if token == "" {
+			return nil, errors.New("github: a token is required (set GITHUB_TOKEN)")
+		}
+		base.Transport = &retryOnAbuse{next: bearerTransport{token: token}}
+		client = github.NewClient(base)
+		if enterpriseURL != nil {
+			client.BaseURL = enterpriseURL
 		}
 	}
 
@@ -117,6 +218,9 @@ func (g *GitHub) PullRequest(ctx context.Context, ref Ref) (*PullRequest, error)
 		HeadRepo: pr.GetHead().GetRepo().GetFullName(),
 		BaseRepo: pr.GetBase().GetRepo().GetFullName(),
 		Draft:    pr.GetDraft(),
+	}
+	if repositoryURL := pr.GetHead().GetRepo().GetHTMLURL(); repositoryURL != "" && out.HeadSHA != "" {
+		out.SourceBaseURL = strings.TrimSuffix(repositoryURL, "/") + "/blob/" + url.PathEscape(out.HeadSHA)
 	}
 	// The head commit's message, for a skip marker; a failure to read it
 	// is not a failure to review, so it is logged by absence only.
@@ -198,11 +302,16 @@ func (g *GitHub) FileContent(ctx context.Context, ref Ref, path string) ([]byte,
 
 	sha := ref.Head
 	if sha == "" {
-		pr, err := g.PullRequest(ctx, ref)
-		if err != nil {
+		var err error
+		if sha, err = g.headSHA(ctx, ref); err != nil {
 			return nil, err
 		}
-		sha = pr.HeadSHA
+	}
+
+	if tree := g.checkoutTree(ctx, sha); tree != nil && tree.regular(path) {
+		if data, err := (&Local{Dir: g.Checkout}).FileContent(ctx, Ref{Head: sha}, path); err == nil {
+			return data, nil
+		}
 	}
 
 	// DownloadContents falls back to listing the parent even after a file 404,
@@ -260,11 +369,16 @@ func (g *GitHub) ListDir(ctx context.Context, ref Ref, dir string) ([]string, er
 
 	sha := ref.Head
 	if sha == "" {
-		pr, err := g.PullRequest(ctx, ref)
-		if err != nil {
+		var err error
+		if sha, err = g.headSHA(ctx, ref); err != nil {
 			return nil, err
 		}
-		sha = pr.HeadSHA
+	}
+
+	if tree := g.checkoutTree(ctx, sha); tree != nil {
+		if names, ok := tree.dirs[strings.Trim(dir, "/")]; ok {
+			return append([]string(nil), names...), nil
+		}
 	}
 
 	file, entries, resp, err := g.client.Repositories.GetContents(ctx, ref.Owner, ref.Repo, strings.Trim(dir, "/"),
@@ -333,6 +447,14 @@ func (g *GitHub) PublishReview(ctx context.Context, ref Ref, review Review) erro
 	}
 
 	body := stripMarkers(review.Summary)
+	// Bounded before the first send. Only the fallback was bounded, and the
+	// fallback runs after GitHub has already refused the whole review, so an
+	// oversize summary cost the inline comments it was posted beside. The
+	// room left is for the markers appended below.
+	body = boundSummary(body, maxSummaryBytes-reservedMarkerBytes)
+	if body == "" && len(review.Progress) > 0 {
+		body = defaultReviewBody(len(comments), "")
+	}
 	if truncated > 0 {
 		body += fmt.Sprintf("\n\n_%d further finding(s) were omitted to keep this review readable._", truncated)
 	}
@@ -349,6 +471,10 @@ func (g *GitHub) PublishReview(ctx context.Context, ref Ref, review Review) erro
 		body += "\n" + completionMarker(review.Head)
 	}
 	if marker := spendMarker(review.Spend); marker != "" {
+		body += "\n" + marker
+	}
+
+	if marker := progressMarker(review.Progress); marker != "" && len(body)+len(marker)+1 <= maxSummaryBytes {
 		body += "\n" + marker
 	}
 
@@ -414,13 +540,27 @@ func (g *GitHub) PublishReview(ctx context.Context, ref Ref, review Review) erro
 	// GitHub computed. Rather than lose the whole review, fall back to posting
 	// the summary alone: a reviewer gets the walkthrough and can act on it.
 	if len(drafts) > 0 && isUnprocessable(err) {
-		// Missing inline findings must be retried before this head is reusable.
-		body = strings.ReplaceAll(body, completionMarker(review.Head), "")
+		// One at a time, because the review is refused as a whole when any
+		// single comment cannot be anchored, and the rest were fine. A comment
+		// that still fails is counted in the summary rather than dropped
+		// silently.
+		posted := g.postDraftsAlone(ctx, ref, review.Head, drafts)
+		if posted < len(drafts) {
+			// Missing inline findings must be retried before this head is reusable.
+			body = strings.ReplaceAll(body, completionMarker(review.Head), "")
+		}
+		if posted > 0 {
+			body += fmt.Sprintf("\n\n_%d of %d inline comment(s) were posted on their own because GitHub refused the review as a whole._", posted, len(drafts))
+		}
+		cause := err
+		if posted == len(drafts) {
+			cause = nil
+		}
 		if _, _, fallbackErr := g.client.PullRequests.CreateReview(ctx, ref.Owner, ref.Repo, ref.Number,
 			&github.PullRequestReviewRequest{
 				CommitID: request.CommitID,
 				Event:    github.Ptr(string(EventComment)),
-				Body:     github.Ptr(summaryFallback(body, err)),
+				Body:     github.Ptr(summaryFallbackFor(body, cause)),
 			}); fallbackErr == nil {
 			return nil
 		}
@@ -491,6 +631,7 @@ func (g *GitHub) PriorReview(ctx context.Context, ref Ref) (*PriorReview, error)
 			}
 			latestID = r.GetID()
 			out.Head = ""
+			out.Progress = parseProgress(body)
 			if ok && strings.Contains(body, completionMarker(head)) {
 				out.Head = head
 			}
@@ -501,6 +642,10 @@ func (g *GitHub) PriorReview(ctx context.Context, ref Ref) (*PriorReview, error)
 		opts.Page = resp.NextPage
 	}
 
+	// Threads this tool closed because a person's reply held. A reply carrying
+	// DismissedMarker is the record, so it survives a new runner and needs no
+	// store of its own.
+	dismissedRoots := map[int64]bool{}
 	copts := &github.PullRequestListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for {
 		comments, resp, err := g.client.PullRequests.ListComments(ctx, ref.Owner, ref.Repo, ref.Number, copts)
@@ -511,6 +656,9 @@ func (g *GitHub) PriorReview(ctx context.Context, ref Ref) (*PriorReview, error)
 			body := c.GetBody()
 			if c.GetUser().GetID() != actor || !strings.Contains(body, g.Bot) {
 				continue
+			}
+			if c.GetInReplyTo() != 0 && strings.Contains(body, DismissedMarker) {
+				dismissedRoots[c.GetInReplyTo()] = true
 			}
 			fp, class, ok := parseFingerprint(body)
 			if !ok {
@@ -537,7 +685,11 @@ func (g *GitHub) PriorReview(ctx context.Context, ref Ref) (*PriorReview, error)
 		if threads, err := g.reviewThreads(ctx, ref); err == nil {
 			standing := out.Comments[:0]
 			for _, c := range out.Comments {
-				if th, known := threads[c.ID]; !known || !th.resolved {
+				th, known := threads[c.ID]
+				if known && th.resolved && dismissedRoots[c.ID] {
+					out.Dismissed = append(out.Dismissed, c.Fingerprint)
+				}
+				if !known || !th.resolved {
 					standing = append(standing, c)
 				}
 			}
@@ -633,6 +785,46 @@ func defaultReviewBody(comments int, marker string) string {
 // it verbatim would fail identically and lose the review entirely.
 const maxSummaryBytes = 60000
 
+// reservedMarkerBytes is the room kept under maxSummaryBytes for the bot,
+// head, completion and spend markers a body gets after it is bounded.
+const reservedMarkerBytes = 1000
+
+// postDraftsAlone posts each draft as its own review comment and returns how
+// many the forge accepted.
+func (g *GitHub) postDraftsAlone(ctx context.Context, ref Ref, head string, drafts []*github.DraftReviewComment) int {
+	posted := 0
+	for _, d := range drafts {
+		c := &github.PullRequestComment{
+			Path:      d.Path,
+			Line:      d.Line,
+			Side:      d.Side,
+			StartLine: d.StartLine,
+			StartSide: d.StartSide,
+			Body:      d.Body,
+		}
+		if head != "" {
+			c.CommitID = github.Ptr(head)
+		}
+		if _, _, err := g.client.PullRequests.CreateComment(ctx, ref.Owner, ref.Repo, ref.Number, c); err == nil {
+			posted++
+		} else if ctx.Err() != nil {
+			// A cancelled run has nothing left to post, and every further
+			// attempt would wait out the abuse-retry sleeps for nothing.
+			break
+		}
+	}
+	return posted
+}
+
+// summaryFallbackFor is summaryFallback when something is still missing, and
+// the body alone, bounded, when every comment was posted after all.
+func summaryFallbackFor(body string, cause error) string {
+	if cause != nil {
+		return summaryFallback(body, cause)
+	}
+	return boundSummary(body, maxSummaryBytes)
+}
+
 // summaryFallback explains why inline comments were dropped, so a silent
 // degradation does not look like a clean review.
 func summaryFallback(body string, cause error) string {
@@ -642,10 +834,18 @@ func summaryFallback(body string, cause error) string {
 
 	note := fmt.Sprintf("\n\n_Inline comments could not be posted (%v)._", truncateBytes(cause.Error(), 500))
 
-	if len(body)+len(note) > maxSummaryBytes {
-		body = truncateBytes(body, maxSummaryBytes-len(note)) + "\n\n_(summary truncated)_"
+	return boundSummary(body, maxSummaryBytes-len(note)) + note
+}
+
+// summaryTruncated ends a summary that was cut to fit.
+const summaryTruncated = "\n\n_(summary truncated)_"
+
+// boundSummary returns body within limit bytes, the truncation note included.
+func boundSummary(body string, limit int) string {
+	if len(body) <= limit {
+		return body
 	}
-	return body + note
+	return truncateBytes(body, limit-len(summaryTruncated)) + summaryTruncated
 }
 
 // truncateBytes trims a string to at most n bytes on a rune boundary.
@@ -722,6 +922,14 @@ func prNumberFromEnv(getenv func(string) string) (int, error) {
 // Threads are a GraphQL notion: the REST comment id is matched to its thread
 // through the thread's first comment, and a thread already resolved, or one
 // this tool cannot find, is left alone and not reported as resolved.
+//
+// A thread counts as resolved only when the mutation says so. Accepting the
+// mutation without reading its answer counted a thread as closed while it was
+// still open, and the approval gate trusts this list, so it would approve
+// beside its own standing comment. A reply is posted before the mutation, so
+// an answer of isResolved:false leaves a reply that names a resolution that
+// did not happen; that is the same shape a reader sees when someone opens a
+// resolved thread again, and it is reported rather than hidden.
 func (g *GitHub) ResolveThreads(ctx context.Context, ref Ref, commentIDs []int64, reply string) ([]int64, error) {
 	if err := validateRef(ref); err != nil {
 		return nil, err
@@ -744,8 +952,18 @@ func (g *GitHub) ResolveThreads(ctx context.Context, ref Ref, commentIDs []int64
 				return resolved, fmt.Errorf("github: reply to comment %d on %s: %w", id, ref, err)
 			}
 		}
-		if err := g.graphql(ctx, `mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }`, map[string]any{"id": th.id}, nil); err != nil {
+		var out struct {
+			ResolveReviewThread struct {
+				Thread struct {
+					IsResolved bool `json:"isResolved"`
+				} `json:"thread"`
+			} `json:"resolveReviewThread"`
+		}
+		if err := g.graphql(ctx, `mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }`, map[string]any{"id": th.id}, &out); err != nil {
 			return resolved, fmt.Errorf("github: resolve thread of comment %d on %s: %w", id, ref, err)
+		}
+		if !out.ResolveReviewThread.Thread.IsResolved {
+			return resolved, fmt.Errorf("github: resolve thread of comment %d on %s: the forge left it open", id, ref)
 		}
 		resolved = append(resolved, id)
 	}
@@ -755,6 +973,20 @@ func (g *GitHub) ResolveThreads(ctx context.Context, ref Ref, commentIDs []int64
 type reviewThread struct {
 	id       string
 	resolved bool
+}
+
+// ThreadResolved reports whether the thread opened by rootID is resolved. A
+// thread this tool cannot find reports false with no error, so a caller that
+// asks before spending a model call errs toward answering.
+func (g *GitHub) ThreadResolved(ctx context.Context, ref Ref, rootID int64) (bool, error) {
+	if err := validateRef(ref); err != nil {
+		return false, err
+	}
+	threads, err := g.reviewThreads(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return threads[rootID].resolved, nil
 }
 
 // reviewThreads maps each thread's first comment (by REST id) to the thread.
@@ -909,6 +1141,11 @@ func (g *GitHub) ThreadComments(ctx context.Context, ref Ref, rootID int64) ([]T
 // exhaust a five-answer cap and refuse the first question anybody asked. The
 // cap bounds how often the reviewer is addressed, and only these comments are.
 const AnswerMarker = "<!-- nitpick:answer -->"
+
+// DismissedMarker is on the reply that closes a finding's thread because the
+// reply under it held. Read back by PriorReview, and honoured only on a
+// comment authenticated as this reviewer, so nobody else can write one.
+const DismissedMarker = "<!-- nitpick:dismissed -->"
 
 // CountAnswers counts the replies the reviewer has posted to mentions on a
 // pull request, conversation comments and inline ones alike.

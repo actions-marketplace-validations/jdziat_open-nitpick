@@ -2,6 +2,7 @@ package review
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -297,5 +298,61 @@ func TestSlopIsOfferedInTheSchemaOnlyWhenSwitchedOn(t *testing.T) {
 	}
 	if !strings.Contains(string(off), `"security"`) {
 		t.Error("the other classes must stay offered")
+	}
+}
+
+func TestProseWithPeriodIsNotCode(t *testing.T) {
+	// An ordinary sentence carries a period, and a contraction carries an
+	// apostrophe. Either must not turn prose into a one-click replacement
+	// that overwrites the line it is anchored to.
+	for _, s := range []string{
+		"Validate the input before using it in the query.",
+		"The caller's error should be returned here.",
+		"A context should carry a deadline.",
+	} {
+		if looksLikeCode(s) {
+			t.Errorf("looksLikeCode(%q) = true, want false", s)
+		}
+	}
+}
+
+// Snapping a finding used to rebuild the file's anchor set each time, so a file
+// with many off-anchor findings paid for every hunk once per finding. The diff
+// here has sixty hunks, which makes a rebuild cost dozens of allocations; with
+// the set hoisted, each extra finding costs a small constant.
+func TestFilterAnchorsBuildsEachFilesAnchorsOnce(t *testing.T) {
+	var raw strings.Builder
+	raw.WriteString("diff --git a/big.go b/big.go\n--- a/big.go\n+++ b/big.go\n")
+	for h := 0; h < 60; h++ {
+		start := h*10 + 1
+		fmt.Fprintf(&raw, "@@ -%d,3 +%d,4 @@\n ctx\n+added\n ctx\n ctx\n", start, start)
+	}
+	files, err := parseDiff(raw.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{Config: baseCfg()}
+
+	// Line 1 is context beside the added line 2, so every copy takes the
+	// snapping path.
+	snapped := func(n int) []Finding {
+		out := make([]Finding, n)
+		for i := range out {
+			out[i] = Finding{Path: "big.go", Line: 1, Severity: "error", Title: "x"}
+		}
+		return out
+	}
+	one, many := snapped(1), snapped(20)
+
+	if got, _ := e.filterAnchors(many, files); len(got) != len(many) || got[0].Line != 2 {
+		t.Fatalf("fixture no longer snaps: %d findings kept, first at line %d", len(got), got[0].Line)
+	}
+
+	cost := func(in []Finding) float64 {
+		return testing.AllocsPerRun(20, func() { e.filterAnchors(append([]Finding(nil), in...), files) })
+	}
+	a1, a20 := cost(one), cost(many)
+	if perFinding := (a20 - a1) / 19; perFinding > 3 {
+		t.Errorf("each extra finding costs %.1f allocations (%v for one, %v for twenty); the anchor set is being rebuilt", perFinding, a1, a20)
 	}
 }

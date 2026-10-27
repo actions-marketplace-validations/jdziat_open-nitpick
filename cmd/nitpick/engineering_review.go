@@ -80,6 +80,12 @@ func assessReviewPractices(ctx context.Context, root string, cfg *config.Config,
 			}
 		}
 	}
+	frozen := map[string][]byte{}
+	if execution := reviewReport.DesignExecution; execution != nil {
+		for _, file := range execution.Sources {
+			frozen[file.Path] = file.Src
+		}
+	}
 	for index, file := range reviewReport.Files {
 		if file.Kind == diff.ChangeDeleted || cfg.Ignored(file.Path) {
 			continue
@@ -92,7 +98,26 @@ func assessReviewPractices(ctx context.Context, root string, cfg *config.Config,
 			}
 			break
 		}
-		body, err := provider.FileContent(ctx, ref, file.Path)
+		var body []byte
+		var err error
+		if execution := reviewReport.DesignExecution; execution != nil {
+			if frozenExcluded(file.Path, execution.Excluded) || frozenOmitted(file.Path, execution.Omitted) {
+				// A file dropped for a disclosed reason (too large, unreadable,
+				// path-limited) is already reported through the design
+				// inventory; that omission is not the drift or unavailability
+				// this check exists to catch, and re-flagging it here would
+				// fail the required snapshot check for every oversized or
+				// unreadable file the design pass already accounted for.
+				continue
+			}
+			var ok bool
+			body, ok = frozen[file.Path]
+			if !ok {
+				err = errors.New("source absent from design snapshot")
+			}
+		} else {
+			body, err = provider.FileContent(ctx, ref, file.Path)
+		}
 		if err != nil {
 			failed = append(failed, file.Path)
 			continue
@@ -152,7 +177,13 @@ func assessReviewPractices(ctx context.Context, root string, cfg *config.Config,
 		}
 	}
 	r.Checks = append(r.Checks, conventions)
-	inventoryFiles, metadataErrors := designContextFiles(ctx, provider, ref, files)
+	var inventoryFiles []standards.File
+	var metadataErrors []string
+	if execution := reviewReport.DesignExecution; execution != nil {
+		inventoryFiles, metadataErrors = frozenDesignContext(files, execution)
+	} else {
+		inventoryFiles, metadataErrors = designContextFiles(ctx, provider, ref, files)
+	}
 	inventory, boundaries := practices.InspectDesign(inventoryFiles, cfg.Practices.Boundaries)
 	if boundaries.State == practices.Unavailable && len(reviewReport.Files) > 0 && !goBoundaryChange(reviewReport.Files) {
 		boundaries.State, boundaries.Reason = practices.NotApplicable, "change contains no Go source or module boundary changes"
@@ -180,7 +211,7 @@ func assessReviewPractices(ctx context.Context, root string, cfg *config.Config,
 			r.Checks = append(r.Checks, practices.Check{ID: "commit-title", Version: "1", Instrument: practices.Deterministic, State: practices.Unavailable, Reason: "no forge PR title available"})
 		}
 	}
-	checks := []practices.Check{{ID: "slop", Version: "1", Instrument: practices.Model, PromptVersion: "engineering-2"}, {ID: "design", Version: "1", Instrument: practices.Model, PromptVersion: "engineering-2"}}
+	checks := []practices.Check{{ID: "slop", Version: "1", Instrument: practices.Model, PromptVersion: engineeringPromptVersion}, {ID: "design", Version: "1", Instrument: practices.Model, PromptVersion: engineeringPromptVersion}}
 	for i := range checks {
 		for _, file := range files {
 			checks[i].Planned = append(checks[i].Planned, practices.Target{Kind: practices.FileTarget, ID: file.Path})
@@ -253,7 +284,17 @@ func reviewAnalyzerCheck(files []standards.File, report *review.Report, cfg *con
 		c.Findings = append(c.Findings, practices.Finding{Rule: finding.Source, Target: practices.Target{Kind: practices.FileTarget, ID: finding.Path, Line: finding.Line}, Title: finding.Title,
 			Rationale: finding.Rationale, Remedy: finding.Suggestion, Severity: finding.Severity, Blocking: true, Sources: []string{finding.Source}})
 	}
-	if report.Plan != nil {
+	// report.Plan.Skipped tracks the review batching plan's own omissions.
+	// In the engineering profile report.Plan is always the design-task
+	// packing plan (assembleDesign sets it whenever DesignExecution is
+	// non-nil), and its Skipped entries are design-task packing limits like
+	// "exceeds review.max_files_per_request": about what the model's design
+	// pass could read, not about golangci-lint or yamllint, which run over
+	// every changed file directly. Reading that packing limit as analyzer
+	// coverage made linters partial on every design task that did not fit a
+	// batch, regardless of whether the file was linted. Analyzer coverage
+	// gaps are already reported precisely through report.Uncovered above.
+	if report.Plan != nil && report.DesignExecution == nil {
 		for _, skip := range report.Plan.Skipped {
 			if skip.Reason != bundle.ReasonIgnored && skip.Reason != bundle.ReasonDeleted {
 				c.State, c.Reason = practices.Partial, skip.Reason
@@ -299,12 +340,88 @@ func designContextFiles(ctx context.Context, provider vcs.Provider, ref vcs.Ref,
 	return out, problems
 }
 
+// goBoundaryChange reports whether the change can move a Go package edge. A
+// manifest counts only when practices.ManifestChangesPackages says so: a
+// dependency bump edits go.mod and go.sum and nothing else, and counting it
+// left the required design-boundaries check unavailable, so every such pull
+// request exited as an incomplete review.
 func goBoundaryChange(files diff.Files) bool {
 	for _, file := range files {
-		for _, name := range []string{file.Path, file.OldPath} {
-			if path.Ext(name) == ".go" || path.Base(name) == "go.mod" || path.Base(name) == "go.work" {
+		if path.Ext(file.Path) == ".go" || path.Ext(file.OldPath) == ".go" {
+			return true
+		}
+		if practices.ManifestChangesPackages(file) {
+			return true
+		}
+		// A renamed or deleted manifest moves a boundary even when the new
+		// path is not a manifest; ManifestChangesPackages reads only Path.
+		if file.OldPath != "" && file.OldPath != file.Path {
+			if base := path.Base(file.OldPath); base == "go.mod" || base == "go.work" {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func frozenExcluded(name string, excluded []bundle.Skip) bool {
+	for _, skip := range excluded {
+		if name == skip.Path || strings.HasPrefix(name, strings.TrimSuffix(skip.Path, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func frozenDesignContext(files []standards.File, execution *review.DesignExecution) ([]standards.File, []string) {
+	out := slices.Clone(files)
+	seen := map[string]bool{}
+	for _, file := range out {
+		seen[file.Path] = true
+	}
+	for _, file := range execution.Sources {
+		if path.Base(file.Path) == "go.mod" && !seen[file.Path] {
+			out = append(out, file)
+			seen[file.Path] = true
+		}
+	}
+	// Design.Errors is the whole design pass's problem list, most of which
+	// (an oversized evidence file, an unrelated unreadable source) says
+	// nothing about whether any directory's go.mod could be identified.
+	// Seeding this check's problems from it made design-boundaries partial
+	// on every unrelated design-packing failure; only the module-resolution
+	// problems the walk below finds belong here.
+	var problems []string
+	for _, file := range files {
+		if path.Ext(file.Path) != ".go" {
+			continue
+		}
+		for dir := path.Dir(file.Path); ; dir = path.Dir(dir) {
+			name := path.Join(dir, "go.mod")
+			// The walk marks a directory's module unresolved only when the
+			// snapshot itself named its go.mod unreadable or excluded. An
+			// unrelated file failing elsewhere in the snapshot (Design.Errors)
+			// says nothing about whether this directory has a nested module at
+			// all; treating it as if it did invented a "module unavailable"
+			// placeholder at every changed directory in the tree.
+			if !seen[name] && (frozenOmitted(name, execution.Omitted) || frozenExcluded(name, execution.Excluded)) {
+				// An unknown nested module must not inherit an outer module's identity.
+				out = append(out, standards.File{Path: name})
+				seen[name] = true
+				problems = append(problems, name+": module metadata unavailable in design snapshot")
+			}
+			if dir == "." {
+				break
+			}
+		}
+	}
+	return out, problems
+}
+
+func frozenOmitted(name string, omitted []bundle.Skip) bool {
+	for _, skip := range omitted {
+		if skip.Path == name {
+			return true
 		}
 	}
 	return false

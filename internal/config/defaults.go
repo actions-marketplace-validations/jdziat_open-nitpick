@@ -119,9 +119,13 @@ func Defaults() *Config {
 			RelatedContext:        true,
 			RelatedContextCallers: false,
 			// Off until its controls are seen to be silent; see
-			// notes/plan-full-review.md, section 2.
 			Slop:                 false,
 			RelatedContextTokens: 16000,
+			Approve: Approve{
+				// Residual max_severity is stated so an operator who turns
+				// residual on without naming a floor gets info, not zero.
+				Residual: ApproveResidual{MaxSeverity: ResidualMaxSeverityDefault},
+			},
 		},
 		Persona: DefaultPersona(),
 		// Stated rather than left to the zero value, because "off" here is a

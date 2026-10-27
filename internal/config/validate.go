@@ -9,6 +9,32 @@ import (
 	"strings"
 )
 
+// ErrNoModel distinguishes missing model settings from invalid configuration.
+var ErrNoModel = errors.New("no reviewer model configured")
+
+// onlyNoModel reports whether every validation error is missing model settings.
+func onlyNoModel(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyNoModel(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyNoModel(wrapped.Unwrap())
+	}
+	return errors.Is(err, ErrNoModel)
+}
+
 // Validate checks the configuration for structural errors. It deliberately runs
 // before any client is constructed or any token is spent.
 //
@@ -120,10 +146,10 @@ func (s ModelSpec) validate(required bool) []error {
 
 	if required {
 		if strings.TrimSpace(s.Provider) == "" {
-			errs = append(errs, errors.New("provider is required"))
+			errs = append(errs, fmt.Errorf("provider is required: %w", ErrNoModel))
 		}
 		if strings.TrimSpace(s.Model) == "" {
-			errs = append(errs, errors.New("model is required"))
+			errs = append(errs, fmt.Errorf("model is required: %w", ErrNoModel))
 		}
 	}
 
@@ -183,7 +209,7 @@ func (s ModelSpec) validate(required bool) []error {
 	}
 
 	switch s.Reasoning {
-	case "", ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningOff:
+	case "", ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh, ReasoningMax, ReasoningOff:
 	default:
 		errs = append(errs, fmt.Errorf("unknown reasoning %q (want %s)",
 			s.Reasoning, strings.Join(ReasoningLevels(), ", ")))
@@ -260,8 +286,52 @@ func (r Review) validate() []error {
 			errs = append(errs, fmt.Errorf("review.ignore[%d]: invalid glob %q", i, pattern))
 		}
 	}
+	errs = append(errs, r.Approve.validate(r.MinSeverity, r.FailOn)...)
 
 	return errs
+}
+
+func (a Approve) validate(minSeverity, failOn Severity) []error {
+	var errs []error
+	if a.Residual.Enabled && !a.Enabled {
+		errs = append(errs, errors.New("review.approve.residual.enabled requires review.approve.enabled"))
+	}
+	errs = append(errs, a.Residual.validate()...)
+	if a.Residual.Enabled {
+		floor := a.Residual.MaxSeverity.normalized()
+		if floor == "" {
+			floor = ResidualMaxSeverityDefault
+		}
+		if floor.Valid() && minSeverity.Valid() && floor.Rank() < minSeverity.Rank() {
+			errs = append(errs, fmt.Errorf(
+				"review.approve.residual.max_severity %q is below review.min_severity %q; residual would never see published findings",
+				floor, minSeverity.normalized()))
+		}
+		// fail_on is the CLI/CI gate. A floor at or above it lets residual
+		// APPROVE a run that still exits non-zero. none is not a finding
+		// severity, so it does not constrain the floor.
+		if floor.Valid() && failOn.Valid() && failOn != SeverityNone && floor.Rank() >= failOn.Rank() {
+			errs = append(errs, fmt.Errorf(
+				"review.approve.residual.max_severity %q meets or exceeds review.fail_on %q; residual would APPROVE a run that fails the gate",
+				floor, failOn.normalized()))
+		}
+	}
+	return errs
+}
+
+func (r ApproveResidual) validate() []error {
+	max := r.MaxSeverity.normalized()
+	// Empty is unset: Defaults and residualMaxSeverity floor at info. Rejecting
+	// it here would force every overlay to restate the default.
+	if max == "" {
+		return nil
+	}
+	for _, allowed := range ResidualMaxSeverities() {
+		if string(max) == allowed {
+			return nil
+		}
+	}
+	return []error{fmt.Errorf("review.approve.residual.max_severity %q must be %s", max, strings.Join(ResidualMaxSeverities(), ", "))}
 }
 
 func (l Linters) validate() []error {

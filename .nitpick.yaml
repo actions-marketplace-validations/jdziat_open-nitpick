@@ -2,21 +2,34 @@
 # README points at, so it stays readable rather than exhaustive.
 
 models:
-  # Synthetic's built-in endpoint lets committed policy select models without
-  # storing credentials. Set SYNTHETIC_API_KEY in the environment or keystore.
+  # OpenRouter rather than Synthetic: a review of this repository is long
+  # enough that Synthetic's queue latency, not the model, decides when the job
+  # ends. Set OPENROUTER_API_KEY in the environment or keystore.
   default:
-    provider: synthetic
-    model: hf:zai-org/GLM-5.3-Flash
+    provider: openrouter
+    model: z-ai/glm-5.3-flash
+    # glm-5.3-flash reasons by default and cannot be told not to, so a review
+    # spent its time thinking: 57s mean on the planted-defect fixtures against
+    # 6s at low, and a 55k-token batch that never answered in ten minutes
+    # (run 37223195160). Recall was 18/20 at the default and 17/20 at low;
+    # docs/findings.md has the table and what it can resolve.
+    reasoning: low
+    # A call still silent after four minutes goes to the fallback instead of
+    # holding the job for the default ten.
+    timeout: 4m
+    fallback:
+      model: qwen/qwen3.8-27b
 
   triage:
-    provider: synthetic
-    model: hf:Qwen/Qwen3.8-27B
+    provider: openrouter
+    model: qwen/qwen3.8-27b
     temperature: 0
+    reasoning: "off"
 
   # Editing quality has not been measured; fixes still require review and CI.
   fix:
-    provider: synthetic
-    model: hf:moonshotai/Kimi-K3
+    provider: openrouter
+    model: z-ai/glm-5.3-flash
     temperature: 0
 
 review:
@@ -29,9 +42,9 @@ review:
   # APPROVE, so a green review check is also a green review disposition.
   approve:
     enabled: true
-  # A million-token model can read far more than 60k tokens per request; the
-  # budget is about how much one call is asked to judge at once, not what
-  # the model can hold. Raised here, where the reviewer is a frontier model.
+  # The default budget is conservative; a model with a large context window
+  # can judge far more than 60k tokens in one call. Raised here, since this
+  # repository's own reviews batch many files per request.
   token_budget_per_request: 120000
   # Definitions the change imports are attached by default. The caller
   # walk, which reads files the change never named, is off by default and
@@ -47,6 +60,11 @@ review:
     # it does not fail to be worth reviewing, it fails to be reviewable, and
     # the batch that tried it failed the run.
     - "internal/knowledge/indexes/**"
+    # Checksums written by `go mod tidy`. A dependency bump rewrites hundreds of
+    # lines of them, tools/go.sum alone runs to 56k tokens, and the slop stage
+    # reports "partial" on them, which fails the review job on a change with
+    # nothing in it a person would read.
+    - "**/go.sum"
 
 instructions:
   - path: "**/*.go"
@@ -75,6 +93,7 @@ linters:
   mode: auto
   enabled: [golangci-lint]
   only_changed_lines: true
+  build_tags: [eval]
 
 practices:
   profile: engineering

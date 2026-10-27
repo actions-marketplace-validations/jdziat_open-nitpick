@@ -17,9 +17,11 @@ var templates embed.FS
 
 // Names of the built-in prompts.
 const (
-	NameReview = "review"
-	NameTriage = "triage"
-	NameRoute  = "route"
+	NameReview          = "review"
+	NameFastReview      = "fast_review"
+	NameTriage          = "triage"
+	NameRoute           = "route"
+	NameApproveResidual = "approve_residual"
 )
 
 // Layer names, in the order they are applied. Later layers appear later in the
@@ -187,10 +189,7 @@ func Build(name string, opts Options) (Prompt, error) {
 	return p, nil
 }
 
-// render executes a template. Templates are authored by the repository owner,
-// who can already run arbitrary code in CI, so this is a convenience rather
-// than a trust boundary, but missing keys are still an error, because a
-// silently empty instruction is worse than a loud failure.
+// render executes a repository-owned prompt template with required keys.
 func render(name, text string, data any) (string, error) {
 	tmpl, err := template.New(name).Option("missingkey=error").Parse(text)
 	if err != nil {

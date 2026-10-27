@@ -157,14 +157,18 @@ type ModelSpec struct {
 	StructuredOutput StructuredMode `yaml:"structured_output"`
 
 	// Reasoning bounds how much a reasoning model thinks before it answers:
-	// "minimal", "low", "medium", "high", or "off" to ask for none.
+	// "minimal", "low", "medium", "high", "xhigh", "max", or "off" to ask for
+	// none. Unset leaves the model's own default, which is the shipped
+	// behaviour and the only setting any measurement here was taken under. A
+	// review that spent 21,423 reasoning tokens to produce 443 tokens of
+	// findings is the case this exists for, and the tradeoff is visible rather
+	// than chosen for an operator: less reasoning is faster and cheaper, and
+	// nothing here has measured what it costs in recall.
 	//
-	// Unset leaves the model's own default, which is the shipped behaviour and
-	// the only setting any measurement here was taken under. A review that
-	// spent 21,423 reasoning tokens to produce 443 tokens of findings is the
-	// case this exists for, and the tradeoff is visible rather than chosen for
-	// an operator: less reasoning is faster and cheaper, and nothing here has
-	// measured what it costs in recall.
+	// The list is the union of what the providers spell, and each level travels
+	// as the word it is. A model advertises the subset it is tuned for, but a
+	// router fronting several models accepts a level the model does not list
+	// and rounds it, so the accepted set is wider than any one model's.
 	//
 	// Providers differ in what they can honour. One that takes a token budget
 	// gets one derived from the level, one with a boolean switch gets the
@@ -519,8 +523,8 @@ type Review struct {
 	Summary bool `yaml:"summary"`
 
 	// Mention is the handle a comment uses to talk to the reviewer:
-	// "@open-nitpick review" reviews again, "@open-nitpick resolve" closes the
-	// thread, anything else is a question answered in the thread.
+	// "@open-nitpick review" resumes, "@open-nitpick restart-review" starts fresh,
+	// "@open-nitpick resolve" closes the thread; anything else is a question.
 	Mention string `yaml:"mention"`
 
 	// SkipMarkers are phrases that, in a pull request's title, body or head
@@ -528,11 +532,10 @@ type Review struct {
 	// posts nothing. Matched case-insensitively.
 	SkipMarkers []string `yaml:"skip_markers"`
 
-	// Incremental makes a run on a pull request this tool has reviewed before
-	// read only the files changed since that review, and withhold findings it
-	// has already posted. It has no effect on a first review, on a local
-	// review, or when the earlier revision is no longer reachable, a force
-	// push reviews the whole change again.
+	// Incremental reuses successful model requests from the previous PR review
+	// when their prompts, context, model and policy still match. Failed work
+	// retries; analyzers, triage, validation and approval run again. False
+	// disables reuse. Local reviews have no persisted progress.
 	Incremental bool `yaml:"incremental"`
 
 	// ResolveSuperseded lets an incremental run resolve its own earlier
@@ -600,6 +603,16 @@ type Review struct {
 	// it. It needs a local checkout and a base revision; without either the run
 	// says so rather than measuring something else.
 	Standards bool `yaml:"standards"`
+
+	// Flow draws, in the walkthrough, how the functions a change edits are
+	// reached and what they reach: the callers up to an entry point and the
+	// callees down to effects on the outside world, from Go source only.
+	//
+	// Off by default. It reads the repository's Go files, which the engineering
+	// profile already does and every other profile otherwise does not, and the
+	// graph follows names without type checking, so a reader should opt in
+	// knowing it is an approximation.
+	Flow bool `yaml:"flow"`
 
 	// KnowledgeQuery is what gets embedded to retrieve against: "batch", the
 	// changed lines of the whole batch as one query, or "file", one query per
@@ -709,6 +722,40 @@ type Approve struct {
 	// it on, an analyzer recorded as skipped or failed, or any entry in the
 	// coverage list, holds the review at a comment.
 	RequireAnalyzers bool `yaml:"require_analyzers"`
+
+	// Residual optionally allows APPROVE when only low-severity findings remain.
+	// See ApproveResidual. Requires Enabled; residual.enabled alone fails Validate.
+	Residual ApproveResidual `yaml:"residual"`
+}
+
+// ApproveResidual is the near-clean path under review.approve.
+//
+// Off by default. When on, published findings whose severity is at most
+// MaxSeverity may still earn APPROVE after a triage-model judge confirms they
+// are non-blocking at the configured nitpick level. Findings above the floor,
+// incomplete runs, and standing threads still force a comment.
+type ApproveResidual struct {
+	// Enabled turns on the residual path. review.approve.enabled must also be
+	// true; residual alone never approves.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxSeverity is the highest published severity still eligible for the
+	// residual judge. One of: nit, info, warning. Default info.
+	MaxSeverity Severity `yaml:"max_severity"`
+}
+
+// MaxSeverityValues reports what review.approve.residual.max_severity accepts.
+func (a ApproveResidual) MaxSeverityValues() []string {
+	return ResidualMaxSeverities()
+}
+
+// ResidualMaxSeverityDefault is the residual floor when max_severity is unset.
+const ResidualMaxSeverityDefault = SeverityInfo
+
+// ResidualMaxSeverities is the residual floor set, shared by validation and
+// the generated reference.
+func ResidualMaxSeverities() []string {
+	return []string{string(SeverityNit), string(SeverityInfo), string(SeverityWarning)}
 }
 
 // Standards controls how conventions are measured and how much evidence one
@@ -883,6 +930,16 @@ type Linters struct {
 	// one here is how to make its absence fail the run. Defaults to on.
 	AutoDetect *bool `yaml:"auto_detect"`
 
+	// BuildTags are added to golangci-lint's own invocation (--build-tags)
+	// and to the build-constraint matcher golangciLint.Uncovered uses to
+	// decide whether a file went unread. A file gated behind a tag not
+	// listed here is unread and reported so; a file gated behind a tag
+	// listed here is linted and matched the same way, so the two do not
+	// collapse into the same "excluded from this build" notice. Empty is the
+	// default: only GOOS/GOARCH constraints are considered, matching a plain
+	// `go build`.
+	BuildTags []string `yaml:"build_tags"`
+
 	// Trusted names analyzers that EXECUTE the tree's own code in order to
 	// analyze it, cargo clippy runs build scripts and procedural macros,
 	// phpstan loads the project's autoloader, and that are therefore
@@ -920,6 +977,22 @@ func (l Linters) CapSeverity(s Severity) Severity {
 	return s
 }
 
+// UnresolvedModelError reports configuration that named no model. A command
+// that supplies its own fallback (fast-review) inspects for this type;
+// everything else treats it as the configuration error it is.
+type UnresolvedModelError struct {
+	Err error
+	// Config is the partial configuration the error came from. Fast-review
+	// reads it to apply its own model fallback.
+	Config *Config
+}
+
+// Error returns the model configuration error.
+func (e *UnresolvedModelError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the model configuration error for errors.Is and errors.As.
+func (e *UnresolvedModelError) Unwrap() error { return e.Err }
+
 // LinterMode selects linter execution behavior.
 type LinterMode string
 
@@ -938,14 +1011,21 @@ func Load(repoRoot string) (*Config, error) {
 }
 
 // LoadFile loads configuration from an explicit path. A missing file yields
-// validated defaults; any other read or parse failure is returned.
+// validated defaults. A configuration that is valid except for naming no model
+// returns an *UnresolvedModelError carrying those defaults, which a command
+// with its own fallback may use; every other read, parse, or validation failure
+// returns no config.
 func LoadFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		cfg, err := defaultConfig()
-		if err != nil {
-			return nil, fmt.Errorf("no %s found and environment is incomplete: %w", FileName, err)
+		cfg, cfgErr := defaultConfig()
+		if cfgErr != nil {
+			var unresolved *UnresolvedModelError
+			if errors.As(cfgErr, &unresolved) && unresolved.Config != nil {
+				unresolved.Config.Missing = path
+			}
+			return cfg, fmt.Errorf("no %s found: %w", FileName, cfgErr)
 		}
 		cfg.Missing = path
 		return cfg, nil
@@ -1004,6 +1084,9 @@ func loadBytes(data []byte, source string) (*Config, error) {
 	cfg.Policy = Policy{Origin: OriginCheckout, Path: source}
 
 	if err := cfg.Validate(); err != nil {
+		if onlyNoModel(err) {
+			return cfg, &UnresolvedModelError{Err: fmt.Errorf("invalid config %s: %w", source, err), Config: cfg}
+		}
 		return nil, fmt.Errorf("invalid config %s: %w", source, err)
 	}
 	return cfg, nil
@@ -1041,6 +1124,9 @@ func defaultConfig() (*Config, error) {
 	cfg.Policy = Policy{Origin: OriginCheckout}
 
 	if err := cfg.Validate(); err != nil {
+		if onlyNoModel(err) {
+			return cfg, &UnresolvedModelError{Err: err, Config: cfg}
+		}
 		return nil, err
 	}
 	return cfg, nil
@@ -1331,6 +1417,8 @@ const (
 	ReasoningLow     ReasoningLevel = "low"
 	ReasoningMedium  ReasoningLevel = "medium"
 	ReasoningHigh    ReasoningLevel = "high"
+	ReasoningXHigh   ReasoningLevel = "xhigh"
+	ReasoningMax     ReasoningLevel = "max"
 	ReasoningOff     ReasoningLevel = "off"
 )
 
@@ -1339,7 +1427,7 @@ const (
 func ReasoningLevels() []string {
 	return []string{
 		string(ReasoningMinimal), string(ReasoningLow), string(ReasoningMedium),
-		string(ReasoningHigh), string(ReasoningOff),
+		string(ReasoningHigh), string(ReasoningXHigh), string(ReasoningMax), string(ReasoningOff),
 	}
 }
 

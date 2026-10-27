@@ -65,7 +65,7 @@ jobs:
       # found nothing. The toolchain comes from go.mod and the analyzer from
       # tools/go.mod, the pair ci.yml uses, because a golangci-lint built with
       # an older Go refuses a go.mod that targets a newer one.
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Install golangci-lint
@@ -76,6 +76,14 @@ jobs:
       - name: Review with the current source
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          NITPICK_APP_INSTALLATION_ID: ${{ steps.app.outputs.installation-id }}
+          NITPICK_APP_PRIVATE_KEY: ${{ secrets.NITPICK_APP_PRIVATE_KEY }}
           NITPICK_BOT_LOGIN: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
-          SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
+          # Runner-owned models apply after policy resolution, so a pull
+          # request cannot select the service that reviews it.
+          NITPICK_REVIEW_PROVIDER: openrouter
+          NITPICK_REVIEW_MODEL: z-ai/glm-5.3-flash
+          NITPICK_TRIAGE_MODEL: qwen/qwen3.8-27b
+          OPENROUTER_API_KEY: >-
+            ${{ secrets.OPENROUTER_API_KEY || secrets.LLM_API_KEY }}
         run: go run ./cmd/nitpick review -skip-draft -fail-on none

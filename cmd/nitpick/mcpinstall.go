@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -19,19 +18,23 @@ import (
 // has a project-scoped file, a user-scoped file, or both, and a shape the
 // file expects; what is written is the same server in that shape.
 type mcpClient struct {
-	name    string
-	note    string
-	project string                                                  // repository-relative path, or ""
-	user    func() (string, error)                                  // absolute path, or ""
-	write   func(cfg map[string]any, command string, args []string) // JSON clients
-	toml    bool                                                    // Codex: a TOML file, appended to
+	name          string
+	note          string
+	project       string                                                  // repository-relative path, or ""
+	user          func() (string, error)                                  // absolute path, or ""
+	write         func(cfg map[string]any, command string, args []string) // JSON clients
+	toml          bool                                                    // Codex: a TOML file, appended to
+	bins          []string                                                // executables on PATH that mean the client is installed
+	dir           []string                                                // home-relative directory that means it, for a client with no user file to look beside
+	skillsProject []string                                                // repository-relative folder the client reads skills from, or nil
+	skillsUser    []string                                                // home-relative folder, or nil
 }
 
 // The shapes below were read from each client's own documentation on
 // 2026-09-06; a client that changes its file will need this table changed.
 var mcpClients = []mcpClient{
 	{
-		name: "claude-code", note: "project: .mcp.json at the repository root; user: `claude mcp add --scope user nitpick -- nitpick mcp` (printed, not run)",
+		name: "claude-code", skillsProject: []string{".claude", "skills"}, skillsUser: []string{".claude", "skills"}, bins: []string{"claude"}, dir: []string{".claude"}, note: "project: .mcp.json at the repository root; user: `claude mcp add --scope user nitpick -- nitpick mcp` (printed, not run)",
 		project: ".mcp.json",
 		write:   writeMCPServers,
 	},
@@ -53,26 +56,27 @@ var mcpClients = []mcpClient{
 		write: writeMCPServers,
 	},
 	{
-		name: "cursor", note: "project: .cursor/mcp.json; user: ~/.cursor/mcp.json",
+		name: "cursor", skillsProject: []string{".cursor", "skills"}, skillsUser: []string{".cursor", "skills"}, bins: []string{"cursor"}, note: "project: .cursor/mcp.json; user: ~/.cursor/mcp.json",
 		project: filepath.Join(".cursor", "mcp.json"),
 		user:    func() (string, error) { return homePath(".cursor", "mcp.json") },
 		write:   writeMCPServers,
 	},
 	{
-		name: "windsurf", note: "user only: ~/.codeium/windsurf/mcp_config.json",
+		name: "windsurf", skillsProject: []string{".windsurf", "skills"}, skillsUser: []string{".codeium", "windsurf", "skills"}, bins: []string{"windsurf"}, note: "user only: ~/.codeium/windsurf/mcp_config.json",
 		user:  func() (string, error) { return homePath(".codeium", "windsurf", "mcp_config.json") },
 		write: writeMCPServers,
 	},
 	{
-		name: "vscode", note: "project: .vscode/mcp.json (Copilot agent mode)",
+		name: "vscode", skillsProject: []string{".github", "skills"}, skillsUser: []string{}, bins: []string{"code"}, note: "project: .vscode/mcp.json (Copilot agent mode)",
 		project: filepath.Join(".vscode", "mcp.json"),
 		write: func(cfg map[string]any, command string, args []string) {
 			servers := sub(cfg, "servers")
-			servers["nitpick"] = map[string]any{"type": "stdio", "command": command, "args": args}
+			server := sub(servers, "nitpick")
+			server["type"], server["command"], server["args"] = "stdio", command, args
 		},
 	},
 	{
-		name: "opencode", note: "project: opencode.json; user: ~/.config/opencode/opencode.json",
+		name: "opencode", skillsProject: []string{".opencode", "skills"}, skillsUser: []string{".config", "opencode", "skills"}, bins: []string{"opencode"}, note: "project: opencode.json; user: ~/.config/opencode/opencode.json",
 		project: "opencode.json",
 		user:    func() (string, error) { return homePath(".config", "opencode", "opencode.json") },
 		write: func(cfg map[string]any, command string, args []string) {
@@ -81,17 +85,21 @@ var mcpClients = []mcpClient{
 			}
 			servers := sub(cfg, "mcp")
 			cmd := append([]any{command}, toAny(args)...)
-			servers["nitpick"] = map[string]any{"type": "local", "command": cmd, "enabled": true}
+			server := sub(servers, "nitpick")
+			server["type"], server["command"] = "local", cmd
+			if _, ok := server["enabled"]; !ok {
+				server["enabled"] = true
+			}
 		},
 	},
 	{
-		name: "gemini-cli", note: "project: .gemini/settings.json; user: ~/.gemini/settings.json",
+		name: "gemini-cli", skillsProject: []string{".gemini", "skills"}, skillsUser: []string{".gemini", "skills"}, bins: []string{"gemini"}, note: "project: .gemini/settings.json; user: ~/.gemini/settings.json",
 		project: filepath.Join(".gemini", "settings.json"),
 		user:    func() (string, error) { return homePath(".gemini", "settings.json") },
 		write:   writeMCPServers,
 	},
 	{
-		name: "codex", note: "user only: ~/.codex/config.toml, appended to",
+		name: "codex", skillsProject: []string{".agents", "skills"}, skillsUser: []string{".agents", "skills"}, bins: []string{"codex"}, note: "user only: ~/.codex/config.toml, appended to",
 		user: func() (string, error) { return homePath(".codex", "config.toml") },
 		toml: true,
 	},
@@ -108,7 +116,8 @@ func homePath(parts ...string) (string, error) {
 // writeMCPServers is the shape most clients share: mcpServers.<name>.
 func writeMCPServers(cfg map[string]any, command string, args []string) {
 	servers := sub(cfg, "mcpServers")
-	servers["nitpick"] = map[string]any{"command": command, "args": args}
+	server := sub(servers, "nitpick")
+	server["command"], server["args"] = command, args
 }
 
 // sub returns cfg[key] as a map, creating it when absent or of another type.
@@ -137,7 +146,6 @@ func runMCPInstall(args []string, stdout io.Writer) error {
 		command string
 		repo    string
 	)
-	say := func(format string, a ...any) { _, _ = fmt.Fprintf(stdout, format, a...) }
 	fs := flag.NewFlagSet("mcp install", flag.ContinueOnError)
 	fs.BoolVar(&global, "user", false, "write the user-wide configuration rather than the project's")
 	fs.BoolVar(&show, "print", false, "print what would be written and write nothing")
@@ -177,68 +185,16 @@ func runMCPInstall(args []string, stdout io.Writer) error {
 		return fmt.Errorf("unknown client %q; run nitpick mcp install -h for the list", clients[0])
 	}
 
-	// A project file is shared through version control, so it names the
-	// command a teammate will have on PATH; a user file is this machine's,
-	// so it names the binary that is here, whether or not PATH finds it.
-	if command == "" {
-		command = "nitpick"
-		if global {
-			if exe, err := os.Executable(); err == nil {
-				command = exe
-			}
-		}
-	}
-	serverArgs := []string{"mcp"}
+	return installMCP(client, mcpInstall{user: global, dryRun: show, command: command, repo: repo}, stdout)
+}
 
-	var path string
-	switch {
-	case global && client.user != nil:
-		p, err := client.user()
-		if err != nil {
-			return err
-		}
-		path = p
-	case global:
-		if client.name == "claude-code" {
-			say("Claude Code keeps user-scoped servers in its own store; run:\n\n  claude mcp add --scope user nitpick -- %s mcp\n", command)
-			return nil
-		}
-		return fmt.Errorf("%s has no user-wide file this command knows; drop -user", client.name)
-	case client.project != "":
-		root, err := filepath.Abs(repo)
-		if err != nil {
-			return err
-		}
-		path = filepath.Join(root, client.project)
-	default:
-		return fmt.Errorf("%s has no project file; pass -user", client.name)
-	}
-
-	var content []byte
-	var err error
-	if client.toml {
-		content, err = mergeTOML(path, command, serverArgs)
-	} else {
-		content, err = mergeJSON(path, command, serverArgs, client.write)
-	}
-	if err != nil {
-		return err
-	}
-	if show {
-		say("%s:\n%s", path, content)
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		return err
-	}
-	say("wrote %s (server nitpick: %s %s)\n", path, command, strings.Join(serverArgs, " "))
-	if _, err := exec.LookPath(command); err != nil && !filepath.IsAbs(command) {
-		say("note: %q is not on PATH here; the client needs it on PATH, or pass -command with the binary's path\n", command)
-	}
-	return nil
+// mcpInstall is one request to register the server with one client.
+type mcpInstall struct {
+	user    bool
+	dryRun  bool
+	terse   bool   // with dryRun, name the file instead of printing it
+	command string // "" picks the default for the scope
+	repo    string
 }
 
 func findClient(name string) (mcpClient, bool) {
@@ -270,38 +226,6 @@ func mergeJSON(path, command string, args []string, write func(map[string]any, s
 		return nil, err
 	}
 	return append(out, '\n'), nil
-}
-
-// mergeTOML appends the server table to a TOML file, or replaces the one
-// already there, without parsing the rest: Codex's file holds settings this
-// command has no business rewriting.
-func mergeTOML(path, command string, args []string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	quoted := make([]string, len(args))
-	for i, a := range args {
-		quoted[i] = fmt.Sprintf("%q", a)
-	}
-	block := fmt.Sprintf("[mcp_servers.nitpick]\ncommand = %q\nargs = [%s]\n", command, strings.Join(quoted, ", "))
-	lines := strings.Split(string(data), "\n")
-	var kept []string
-	skipping := false
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "[") {
-			skipping = t == "[mcp_servers.nitpick]" || strings.HasPrefix(t, "[mcp_servers.nitpick.")
-		}
-		if !skipping {
-			kept = append(kept, line)
-		}
-	}
-	text := strings.TrimRight(strings.Join(kept, "\n"), "\n")
-	if text != "" {
-		text += "\n\n"
-	}
-	return []byte(text + block), nil
 }
 
 // mcpClientNames lists the clients, for help text and tests.

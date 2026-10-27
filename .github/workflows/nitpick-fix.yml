@@ -67,10 +67,13 @@ jobs:
           private-key: ${{ secrets.NITPICK_APP_PRIVATE_KEY }}
 
       - uses: ./
+        env:
+          NITPICK_APP_INSTALLATION_ID: ${{ steps.app.outputs.installation-id }}
+          NITPICK_APP_PRIVATE_KEY: ${{ secrets.NITPICK_APP_PRIVATE_KEY }}
         with:
           command: respond
           bot-login: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
           github-token: ${{ steps.app.outputs.token }}
-          provider: synthetic
-          model: hf:moonshotai/Kimi-K3
-          api-key: ${{ secrets.SYNTHETIC_API_KEY }}
+          provider: openrouter
+          model: z-ai/glm-5.3-flash
+          api-key: ${{ secrets.OPENROUTER_API_KEY || secrets.LLM_API_KEY }}

@@ -19,6 +19,19 @@ inputs:
     required: false
     default: ${{ github.token }}
 
+  app-installation-id:
+    description: >-
+      GitHub App installation ID. When set with app-private-key, the review
+      mints its own tokens as the current one nears expiry, so a run that
+      outlives the roughly one hour a minted token lasts still publishes.
+    required: false
+
+  app-private-key:
+    description: >-
+      GitHub App private key, matching app-installation-id. Pass the secret;
+      never a literal.
+    required: false
+
   config:
     description: Path to the configuration file, relative to the workspace.
     required: false
@@ -68,6 +81,15 @@ inputs:
     required: false
     default: "false"
 
+  allow-degraded-triage:
+    description: >-
+      When the review finished and only triage failed, publish the findings,
+      apply fail-on to them, and set result to "degraded" instead of exiting
+      2. Any other failed stage, or a file that went unreviewed, is still an
+      error.
+    required: false
+    default: "false"
+
   version:
     description: >-
       Version of open-nitpick to install: a release tag such as v1.0.0, or
@@ -80,7 +102,7 @@ inputs:
 
   analyzers:
     description: >-
-      Deterministic analyzers to install on the runner before the review, as
+      Deterministic analyzers to install before a full review, as
       a comma-separated list of catalog names (run "nitpick linters" for
       them), or "auto" to install the ones for the languages the change
       touches. Empty installs nothing: the review then runs whatever the
@@ -90,22 +112,24 @@ inputs:
 
   command:
     description: >-
-      What to run: "review" (the default) reviews the pull request; "respond"
+      What to run: "review" (the default), "fast-review" for a quick
+      changed-diff pass, or "respond"
       answers a comment that mentioned the reviewer, for a workflow on
       issue_comment and pull_request_review_comment events.
     required: false
     default: review
   args:
-    description: Additional flags passed verbatim to "nitpick review".
+    description: Additional flags passed verbatim to review and fast-review.
     required: false
 
 outputs:
   result:
     description: >-
       One of "clean" (no findings at or above fail-on), "findings" (the gate
-      was tripped), "skipped" (a draft, with skip-drafts), or "error" (the
-      review could not run). Distinguishing the last is the point: a broken
-      reviewer must not read as a passing one.
+      was tripped), "skipped" (a draft, with skip-drafts), "degraded"
+      (findings published but triage did not run, with allow-degraded-triage),
+      or "error" (the review could not run). Distinguishing the last is the
+      point: a broken reviewer must not read as a passing one.
     value: ${{ steps.review.outputs.result }}
 
   findings:
@@ -209,14 +233,12 @@ runs:
 
     - name: Set up Go
       if: steps.install.outputs.source == 'build'
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: stable
         cache: false
 
-    # The Action's own files are on the runner at the ref the workflow named,
-    # so the binary can be built from them without fetching the module — which
-    # is what makes the Action usable from a private copy of this repository.
+    # Private forks may have no reachable release, so build from this checkout.
     - name: Build open-nitpick from the Action's checkout
       if: steps.install.outputs.source == 'build'
       shell: bash
@@ -237,7 +259,7 @@ runs:
     # own release or package index at a pinned version, and put on PATH.
     - name: Decide which analyzers to install
       id: analyzers
-      if: inputs.analyzers != ''
+      if: inputs.command == 'review' && inputs.analyzers != ''
       shell: bash
       env:
         WANT: ${{ inputs.analyzers }}
@@ -281,21 +303,23 @@ runs:
         echo "installing analyzers: ${want:-none}"
 
     - name: Set up Go for analyzers
-      if: inputs.analyzers != '' && contains(steps.analyzers.outputs.want, 'golangci-lint')
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      if: >-
+        inputs.command == 'review' && inputs.analyzers != '' &&
+        contains(steps.analyzers.outputs.want, 'golangci-lint')
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: stable
         cache: false
 
     - name: Cache analyzer binaries
-      if: inputs.analyzers != ''
+      if: inputs.command == 'review' && inputs.analyzers != ''
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.nitpick-analyzers
         key: nitpick-analyzers-${{ runner.os }}-${{ runner.arch }}-v1-${{ steps.analyzers.outputs.key }}
 
     - name: Install analyzers
-      if: inputs.analyzers != ''
+      if: inputs.command == 'review' && inputs.analyzers != ''
       shell: bash
       env:
         WANT: ${{ steps.analyzers.outputs.want }}
@@ -361,6 +385,8 @@ runs:
       # arbitrary commands in this step.
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        NITPICK_APP_INSTALLATION_ID: ${{ inputs.app-installation-id }}
+        NITPICK_APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
         NITPICK_BOT_LOGIN: ${{ inputs.bot-login }}
         LLM_PROVIDER: ${{ inputs.provider }}
         LLM_MODEL: ${{ inputs.model }}
@@ -371,6 +397,7 @@ runs:
         NITPICK_INSTRUCTION: ${{ inputs.instruction }}
         NITPICK_DRY_RUN: ${{ inputs.dry-run }}
         NITPICK_SKIP_DRAFTS: ${{ inputs.skip-drafts }}
+        NITPICK_ALLOW_DEGRADED_TRIAGE: ${{ inputs.allow-degraded-triage }}
         NITPICK_ARGS: ${{ inputs.args }}
         EVENT_NAME: ${{ github.event_name }}
         NITPICK_COMMAND: ${{ inputs.command }}
@@ -399,6 +426,9 @@ runs:
         if [ "$NITPICK_SKIP_DRAFTS" = "true" ]; then
           flags+=(-skip-draft)
         fi
+        if [ "$NITPICK_ALLOW_DEGRADED_TRIAGE" = "true" ]; then
+          flags+=(-allow-degraded-triage)
+        fi
 
         if [ "$NITPICK_COMMAND" = "respond" ]; then
           # A comment event: the payload names the pull request and the
@@ -419,6 +449,13 @@ runs:
           echo "result=clean" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+        case "$NITPICK_COMMAND" in
+          review|fast-review) ;;
+          *) message="command must be review, fast-review, or respond"
+             echo "::error::open-nitpick: $message"
+             echo "result=error" >> "$GITHUB_OUTPUT"
+             exit 2 ;;
+        esac
 
         # What to review depends on the event. A pull request event names its
         # pull request through the environment; a dispatch or a comment names
@@ -470,13 +507,11 @@ runs:
         # The CLI writes result, findings and the per-severity counts to
         # GITHUB_OUTPUT itself, and the review to GITHUB_STEP_SUMMARY.
         set +e
-        nitpick review "${flags[@]}" ${extra+"${extra[@]}"}
+        nitpick "$NITPICK_COMMAND" "${flags[@]}" ${extra+"${extra[@]}"}
         status=$?
         set -e
 
-        # Exit 1 means the review ran and tripped the configured gate, which
-        # should fail the job. Exit 2 means the review could not run at all —
-        # a materially different outcome that must not read as "found issues".
+        # Exit 1 indicates findings; other nonzero exits mean review failed.
         case "$status" in
           0|1) ;;
           *) echo "::error::open-nitpick failed to run (exit $status)"

@@ -8,35 +8,32 @@ hide:
 
 # Pull request review you can read the source of.
 
-<p class="np-lede">open-nitpick reads a pull request, reviews it with a model you choose, and posts inline comments. Run it as a GitHub Action, as a CLI in any CI, or against your working tree before the pull request exists. Nothing is hosted, nothing is priced per seat, and your code stays with you.</p>
+<p class="np-lede">open-nitpick reviews pull requests with the model provider you choose and can post inline comments. Run it as a GitHub Action, in any CI system, from an agent, or against local changes before a pull request exists. The reviewer is self-hosted; review input is sent to the model provider you configure. Choose a local provider to keep review input on your machine.</p>
 
 <div class="np-actions" markdown>
-[Get started](docs/usage.md){ .md-button .md-button--primary }
-[Read the measurements](docs/findings.md){ .md-button }
-[Source on GitHub](https://github.com/jdziat/open-nitpick){ .md-button }
+[Get started](docs/getting-started.md){ .md-button .md-button--primary }
+[CLI reference](docs/reference/cli.md){ .md-button }
+[Set up CI](docs/ci.md){ .md-button }
 </div>
 
-<div class="np-stat" markdown>
-<div markdown><strong>5</strong><span>corpora, four re-runnable</span></div>
-<div markdown><strong>20</strong><span>instrument bugs recorded</span></div>
-<div markdown><strong>1</strong><span>published claim retracted</span></div>
-</div>
-<p class="np-fine">Corpora and the retraction as of 2026-09-05. The instrument-bug count is the number of rows in <a href="docs/findings/">the findings</a> table, and a test holds this figure to it.</p>
+<p class="np-fine"><a href="docs/guide/reviewing-changes/">Review changes</a> · <a href="docs/configuration/">Configure models and policy</a> · <a href="docs/guide/agents-and-mcp/">Use from an agent</a> · <a href="docs/usage/">All workflows</a> · <a href="docs/trust-model/">Trust model</a></p>
+
+<p class="np-fine">Read the <a href="docs/providers/">provider guidance</a> before selecting a hosted endpoint, inspect the <a href="docs/findings/">measurements</a>, or read the <a href="https://github.com/jdziat/open-nitpick">source on GitHub</a>.</p>
 
 </div>
 
 <div class="np-prose" markdown>
 
 ```bash
-# A signed binary, or `go install …/cmd/nitpick@latest` with Go 1.25.5.
+# A release binary, or `go install …/cmd/nitpick@latest` with Go 1.26.0.
 v=$(gh release view --repo jdziat/open-nitpick --json tagName -q .tagName)
 os=$(uname -s | tr 'A-Z' 'a-z'); arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -fsSLo nitpick "https://github.com/jdziat/open-nitpick/releases/download/$v/nitpick_${v}_${os}_${arch}"
 chmod +x nitpick && sudo mv nitpick /usr/local/bin/
 
-export LLM_PROVIDER=synthetic
-export LLM_MODEL=hf:moonshotai/Kimi-K3
-export SYNTHETIC_API_KEY=syn_...
+export LLM_PROVIDER=openrouter
+export LLM_MODEL=z-ai/glm-5.3-flash
+export OPENROUTER_API_KEY=sk-or-...
 
 nitpick review          # reviews your uncommitted changes
 ```
@@ -46,33 +43,33 @@ nitpick review          # reviews your uncommitted changes
 <div class="np-grid" markdown>
 
 <div class="np-card" markdown>
-<p class="np-card-title">Any model, different models per job</p>
-Eighteen providers, with Synthetic and OpenRouter built in, plus any OpenAI-compatible endpoint, Ollama and llama.cpp. A cheap model triages and a strong one reviews. An expert pass can overrule either. [Configuration&nbsp;→](docs/configuration.md)
+<p class="np-card-title">Bring your own models</p>
+18 providers, any OpenAI-compatible endpoint, Ollama and llama.cpp. A cheap model triages, a strong one reviews. [Configuration&nbsp;→](docs/configuration.md)
 </div>
 
 <div class="np-card" markdown>
-<p class="np-card-title">Prompts you can print before you pay</p>
-Path-scoped instructions live next to the code they describe. `nitpick explain-config` shows the exact prompt a file would get. [Instructions&nbsp;→](docs/configuration.md#personality-and-how-much-it-nitpicks)
+<p class="np-card-title">Inspectable prompts</p>
+Path-scoped instructions in your repo. `nitpick explain-config` prints the exact prompt. [Instructions&nbsp;→](docs/configuration.md#personality-and-how-much-it-nitpicks)
 </div>
 
 <div class="np-card" markdown>
-<p class="np-card-title">Context in both directions</p>
-The definitions a changed line calls are attached by default. So are the untouched callers of anything a change redefines, behind a switch of their own, since that walk reads files the change never named. [Related context&nbsp;→](docs/configuration.md#related-context)
+<p class="np-card-title">Related context</p>
+Definitions the change uses, attached by default. Callers of what it redefines, opt-in. [Related context&nbsp;→](docs/configuration.md#related-context)
 </div>
 
 <div class="np-card" markdown>
-<p class="np-card-title">A trust model, written down</p>
-A change cannot supply the policy it is reviewed under. Policy is read from the base revision. Analyzer configuration never comes from the tree, and endpoint keys are stripped from a config the change could have written. [Trust model&nbsp;→](docs/trust-model.md)
+<p class="np-card-title">Trust model</p>
+Policy from the base revision. By default, a PR cannot change endpoints or credentials. [Trust model&nbsp;→](docs/trust-model.md)
 </div>
 
 <div class="np-card" markdown>
-<p class="np-card-title">Linters as evidence, not noise</p>
-Thirty-three, configured from outside the tree they read. golangci-lint and ruff ship enabled, twenty-four more run whenever they are installed, and eslint, semgrep and five others wait until you name them. Their output goes to the model for triage instead of into the pull request. [Analyzers&nbsp;→](docs/analyzers.md)
+<p class="np-card-title">Integrated tools as extra evidence</p>
+golangci-lint, ruff, eslint, semgrep and more. Their output is evidence for the model. [Analyzers&nbsp;→](docs/analyzers.md)
 </div>
 
 <div class="np-card" markdown>
-<p class="np-card-title">Measured, mistakes included</p>
-Five corpora and a judge-free harness. The findings document records the instrument bugs found along the way, including the one that forced a retraction. [Findings&nbsp;→](docs/findings.md)
+<p class="np-card-title">Published measurements</p>
+Five corpora, no model judge. Every instrument bug logged, one retraction included. [Findings&nbsp;→](docs/findings.md)
 </div>
 
 </div>
@@ -89,6 +86,6 @@ Five corpora and a judge-free harness. The findings document records the instrum
 
 [The full walkthrough&nbsp;→](docs/how-a-review-runs.md)
 
-<p class="np-fine" markdown>The quickstart uses [Synthetic](https://synthetic.new/?referral=KBc4DHaHWcig6zR), which serves open-weight models on a flat subscription. Their pricing page read $30 a month for one pack on 2026-09-05. That link carries the author's referral code and pays the author referral credit if you sign up through it. [synthetic.new](https://synthetic.new) without the code is the same service at the same price. You can spend nothing first: `nitpick explain-config` prints what a review would send without sending it, and `LLM_PROVIDER=ollama` runs against a local model. [Why, and the alternatives&nbsp;→](docs/providers.md#synthetic-recommended)</p>
+<p class="np-fine" markdown>The quickstart uses OpenRouter with GLM-5.3-Flash, the reviewer this repository uses in CI. You can spend nothing first: `nitpick explain-config` prints what a review would send without sending it, and `LLM_PROVIDER=ollama` runs against a local model. [Why, and the alternatives&nbsp;→](docs/providers.md#openrouter-recommended)</p>
 
 </div>

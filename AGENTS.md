@@ -41,6 +41,16 @@ belongs in the commit that made it. `nitpick slop` will tell you when a comment
 restates its line, narrates a changelog, or runs longer than the declaration it
 documents.
 
+## Constructors
+
+A type whose zero value cannot do its job is built by a package-level
+function, so a struct literal that omits a field is a compile error instead of
+a review that quietly means something else. The builder is `New<T>`, or
+`Build<T>` where construction can fail on configuration rather than on
+arguments. Today that is `review.NewEngine`, `llm.Build` and
+`llm.BuildEmbedder`; production code does not write an `Engine` literal.
+Plain values such as `evals.Price` need no builder.
+
 <!-- nitpick:standards:begin -->
 
 ## Conventions, measured
@@ -51,10 +61,10 @@ code demonstrates. The evidence after each is a band, not a count: run
 `make agents` to regenerate this block.
 
 - Name a test after the behaviour it pins, in at least three words. (every site of 1000+ places)
-- Open an exported declaration's doc comment with the declaration's own name. (every site of 700+ places)
-- Put context.Context first in the parameter list. (every site of 200+ places)
+- Open an exported declaration's doc comment with the declaration's own name. (every site of 800+ places)
+- Put context.Context first in the parameter list. (every site of 300+ places)
 - Wrap an error you are formatting into a new one with %w, not %v or %s. (every site of 200+ places)
 - Call t.Helper() at the top of a test helper. (every site of 100+ places)
-- Return named results explicitly; do not use a bare return. (every site of 50+ places)
+- Return named results explicitly; do not use a bare return. (every site of 60+ places)
 
 <!-- nitpick:standards:end -->

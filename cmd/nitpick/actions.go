@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jdziat/open-nitpick/internal/bundle"
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/review"
 	"github.com/jdziat/open-nitpick/internal/vcs"
@@ -31,8 +32,33 @@ const (
 	resultClean    actionResult = "clean"    // no findings at or above the gate
 	resultFindings actionResult = "findings" // the gate was tripped
 	resultSkipped  actionResult = "skipped"  // nothing was reviewed on purpose (a draft)
+	resultDegraded actionResult = "degraded" // findings published, triage did not run, and the caller allowed that
 	resultError    actionResult = "error"    // the review could not run
 )
+
+// allowDegradedTriage reclassifies the one failure a caller can choose to
+// live with. It applies only when triage is the sole stage that failed and no
+// file went unreviewed: the findings are real and merely unranked, and the
+// result says so ("degraded") instead of calling the run clean. Any other
+// failed stage, or an engineering report that owns its own completeness, stays
+// an error.
+func allowDegradedTriage(report *review.Report, gate config.Severity) actionResult {
+	if report == nil || report.Practices != nil || !report.Complete() {
+		return resultError
+	}
+	// A bounded fast review that left a changed file unread is an error on its
+	// own account; forgiving triage must not launder it.
+	if report.FastReview && fastReviewSkippedFiles(report) {
+		return resultError
+	}
+	if len(report.Stages) != 1 || report.Stages[0].Stage != "triage" {
+		return resultError
+	}
+	if report.Failed(gate) {
+		return resultFindings
+	}
+	return resultDegraded
+}
 
 // actionsEnv reads the two files, when Actions provides them.
 type actionsEnv struct {
@@ -204,6 +230,22 @@ func mdCell(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// fastReviewSkippedFiles reports whether the bounded plan left a changed file
+// unread. Ordinary planner exclusions cannot name reviewable change coverage.
+func fastReviewSkippedFiles(report *review.Report) bool {
+	if report == nil || report.Plan == nil {
+		return false
+	}
+	for _, skip := range report.Plan.Skipped {
+		switch skip.Reason {
+		case bundle.ReasonIgnored, bundle.ReasonGenerated, bundle.ReasonBinary, bundle.ReasonDeleted, bundle.ReasonNoChanges:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // resultFor classifies a finished review the way the Action's outputs do.
 //
 // Completeness is asked before severity, and it is not subject to fail-on. A
@@ -216,6 +258,12 @@ func resultFor(report *review.Report, gate config.Severity) actionResult {
 		return resultError
 	}
 	if !report.PipelineComplete() {
+		return resultError
+	}
+	// A bounded fast review is clean only when it read every changed file. It
+	// is never reusable as a full-review baseline, but that must not turn a
+	// complete fast pass into an Action error.
+	if report.FastReview && fastReviewSkippedFiles(report) {
 		return resultError
 	}
 	if report.Practices != nil && report.Practices.ExitCode() == 1 {

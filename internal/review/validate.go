@@ -88,6 +88,9 @@ type Validator struct {
 	// Concurrency bounds in-flight validation calls.
 	Concurrency int
 
+	// PromptTokenLimit bounds complete design evidence without truncating it.
+	PromptTokenLimit int
+
 	// Log receives the verdicts; a nil logger discards them.
 	Log *slog.Logger
 
@@ -146,7 +149,11 @@ func (v *Validator) validateWithCoverage(ctx context.Context, findings []Finding
 				return
 			}
 
-			outcomes[i] = v.check(ctx, f, code[f.Path])
+			source := code[f.Path]
+			if f.TaskContext != nil {
+				source = f.TaskContext.Text
+			}
+			outcomes[i] = v.check(ctx, f, source)
 		}(i, f)
 	}
 
@@ -304,6 +311,19 @@ func (v *Validator) check(ctx context.Context, f Finding, code string) outcome {
 		{Role: llms.RoleUser, Content: validationRequest(f, code, shown)},
 	}
 
+	if f.TaskContext != nil && v.PromptTokenLimit > 0 {
+		schemaJSON, err := validationSchema()
+		if err != nil {
+			keep.failure = "validation schema unavailable"
+			return keep
+		}
+		estimator := llms.DefaultTokenEstimator()
+		tokens := estimator.EstimateTokens(msgs[0].Content) + estimator.EstimateTokens(msgs[1].Content) + estimator.EstimateTokens(string(schemaJSON)) + 128
+		if tokens > v.PromptTokenLimit {
+			keep.failure = "complete design evidence exceeds expert prompt token limit"
+			return keep
+		}
+	}
 	result, err := llm.Extract[validationResult](ctx, v.Client, msgs, schema)
 	if err != nil {
 		// An outage must not silently empty a review. Losing a validation is a
@@ -546,7 +566,9 @@ Answer with exactly one verdict:
   way to remove one, it records that the check came back undecided.
 - ` + "`severity`" + ` — the defect is real, but rated wrong. Set
   ` + "`revised_severity`" + ` to the level the demonstrated consequence
-  supports and say why in ` + "`reason`" + `. Rate what you can demonstrate, not
+  supports and say why in ` + "`reason`" + `. This verdict requires a nonempty
+  revised level; naming severity without that value is invalid. For other
+  verdicts, omit the revised level. Rate what you can demonstrate, not
   the worst imaginable outcome; when torn between two levels, choose the lower.
 
 Refute ONLY when you can state that reason. "I could not confirm this", "there
@@ -722,7 +744,6 @@ var nullish = map[string]bool{
 //
 // Only a single token counts, because an id is one word: a sentence in this
 // field is an answer in the wrong form rather than a claimed source. See
-// docs/harness-notes.md#naming-a-citation for what that gates and why the
 // alternative, deciding whether a sentence means nothing, is not decidable
 // from the string.
 func namesSomething(said string) bool {

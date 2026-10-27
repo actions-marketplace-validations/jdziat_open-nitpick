@@ -226,8 +226,6 @@ func resolveConfig(path, repoRoot string) (string, error) {
 
 // golangciDefaults is the golangci-lint configuration open-nitpick owns.
 //
-// The note behind it is in docs/runner-notes.md#golangcidefaults.
-//
 //go:embed golangci.yml
 var golangciDefaults []byte
 
@@ -312,12 +310,29 @@ type golangciLint struct {
 	// operator supplied no config, and `--enable=gosec` on every invocation so
 	// an operator config that disables it cannot greenwash the security roster.
 	ForceGosec bool
+
+	// BuildTags are passed to golangci-lint as --build-tags and to the
+	// build-constraint matcher Uncovered uses, so a file gated behind one of
+	// them is both linted and not reported as excluded from this build. See
+	// config.Linters.BuildTags.
+	BuildTags []string
 }
 
 func (g *golangciLint) Name() string { return "golangci-lint" }
 
 // GosecForced reports whether this runner enables gosec for the security roster.
 func (g *golangciLint) GosecForced() bool { return g.ForceGosec }
+
+// matchContext is the build.Context Uncovered matches a file's constraints
+// against: this run's BuildTags, and the child's CgoEnabled from goEnv
+// rather than this process's own, which //go:build cgo needs and the
+// separate, import-scanning cgoExcluded check does not cover.
+func (g *golangciLint) matchContext(cgoEnabled bool) *build.Context {
+	ctx := build.Default
+	ctx.CgoEnabled = cgoEnabled
+	ctx.BuildTags = g.BuildTags
+	return &ctx
+}
 
 // Detect reports why golangci-lint will not run, and nil when it will.
 //
@@ -463,6 +478,9 @@ func (g *golangciLint) Run(ctx context.Context, repoRoot string, files []string)
 	for _, t := range targets {
 		args := []string{"run", "--config", configRef}
 		args = append(args, golangciReportArgs...)
+		if len(g.BuildTags) > 0 {
+			args = append(args, "--build-tags", strings.Join(g.BuildTags, ","))
+		}
 		// Always, including when the operator supplied golangci_config: a file
 		// with default: none or gosec disabled must not report ran without it.
 		if g.ForceGosec {
@@ -500,8 +518,6 @@ func (g *golangciLint) Run(ctx context.Context, repoRoot string, files []string)
 }
 
 // findings converts one golangci-lint report into findings.
-//
-// The note behind it is in docs/runner-notes.md#findings.
 func (g *golangciLint) findings(out []byte, exit int) ([]Finding, error) {
 	var parsed golangciOutput
 	if err := decodeJSON(out, &parsed); err != nil {
@@ -545,8 +561,6 @@ func (g *golangciLint) findings(out []byte, exit int) ([]Finding, error) {
 
 // golangciReportArgs are the flags that decide how much of golangci-lint's
 // report reaches this process, and how its positions are spelled.
-//
-// The note behind it is in docs/runner-notes.md#golangcireportargs.
 var golangciReportArgs = []string{
 	"--output.json.path", "stdout",
 	"--issues-exit-code", "0",
@@ -625,8 +639,6 @@ func goDirectiveLine(name string, src []byte) int {
 // positionsRewritten reports why golangci-lint's output cannot be anchored,
 // scanning the packages that are about to be analyzed, and returns "" when it
 // can.
-//
-// The note behind it is in docs/runner-notes.md#positionsrewritten.
 func positionsRewritten(repoRoot string, targets []goTarget) string {
 	for _, t := range targets {
 		for _, d := range t.Dirs {
@@ -671,8 +683,6 @@ func positionsRewritten(repoRoot string, targets []goTarget) string {
 
 // covering is a runner that can name the parts of the change it did not
 // analyze, for an analyzer that otherwise ran and reported.
-//
-// The note behind it is in docs/runner-notes.md#covering.
 type covering interface {
 	Uncovered(ctx context.Context, repoRoot string, files []string, diffs diff.Files) []review.LinterUncovered
 }
@@ -793,8 +803,9 @@ func parseGoEnv(out []byte) (goBuildContext, bool) {
 // grammar are the toolchain's, and an approximation of them is a list of the
 // cases somebody thought of.
 //
-// GOOS/GOARCH come from this process, which golangci-lint inherits with no
-// build tags on top, so MatchFile answers the constraint question the run
+// GOOS/GOARCH come from this process, which golangci-lint inherits, and the
+// build tags it is given are the same ones MatchFile applies (see
+// matchContext), so MatchFile answers the constraint question the run
 // depends on. It cannot answer the cgo one: with cgo off the go tool drops a
 // file importing "C" from the package and MatchFile still matches it, reading
 // build constraints and filename suffixes but never the import list. A
@@ -891,7 +902,7 @@ func (g *golangciLint) Uncovered(ctx context.Context, repoRoot string, files []s
 		// (false, err) is a file we could not read, which is not the same claim
 		// as a file the build excludes; golangci-lint reports its own read
 		// failures and inventing one here would be a guess.
-		switch match, err := build.Default.MatchFile(filepath.Dir(full), filepath.Base(full)); {
+		switch match, err := g.matchContext(goEnv.CgoEnabled).MatchFile(filepath.Dir(full), filepath.Base(full)); {
 		case err != nil:
 			continue
 		case !match:
@@ -1005,8 +1016,6 @@ func (g *golangciLint) notSelected(repoRoot string, files []string, diffs diff.F
 
 // cgoExcluded reports whether the go tool drops this file from its package
 // because it imports "C" while cgo is off.
-//
-// The note behind it is in docs/runner-notes.md#cgoexcluded.
 func cgoExcluded(file string, cgoEnabled bool) bool {
 	if cgoEnabled {
 		return false
@@ -1198,8 +1207,6 @@ func parentDir(d string) string {
 
 // repoPath turns a path an analyzer printed relative to its own working
 // directory back into one relative to the repository.
-//
-// The note behind it is in docs/runner-notes.md#repopath.
 func repoPath(repoRoot, module, reported string) string {
 	if filepath.IsAbs(reported) {
 		return relative(repoRoot, reported)
@@ -1306,8 +1313,6 @@ type eslint struct{ cfg analyzerConfig }
 func (e *eslint) Name() string { return "eslint" }
 
 // Detect requires an operator-supplied config, so eslint is OFF by default.
-//
-// The note behind it is in docs/runner-notes.md#detect.
 func (e *eslint) Detect(_ context.Context, repoRoot string, files []string) error {
 	if e.cfg.Err != nil {
 		return e.cfg.Err
@@ -1533,8 +1538,6 @@ func (s *semgrep) findings(out []byte, exit int) ([]Finding, error) {
 }
 
 // mapSeverity translates an analyzer's severity vocabulary to ours.
-//
-// The note behind it is in docs/runner-notes.md#mapseverity.
 func mapSeverity(s string) config.Severity {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "CRITICAL":
@@ -1615,8 +1618,6 @@ func relativeTo(root, path string) (string, bool) {
 // decodeJSON decodes an analyzer's JSON payload out of its stdout, and
 // REQUIRES
 // one.
-//
-// The note behind it is in docs/runner-notes.md#decodejson.
 func decodeJSON(out []byte, target any) error {
 	trimmed := trimToJSON(out)
 	if len(trimmed) == 0 {

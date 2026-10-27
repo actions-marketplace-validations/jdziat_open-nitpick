@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/jdziat/open-nitpick/internal/config"
@@ -52,5 +54,39 @@ func TestBuildRolesGivesValidateItsOwnClientOnTheReviewModel(t *testing.T) {
 	}
 	if !sawReview || !sawValidate {
 		t.Errorf("Each visited review=%v validate=%v, want both", sawReview, sawValidate)
+	}
+}
+
+func TestBuildRolesContextCancelsCredentialCommands(t *testing.T) {
+	clearModelEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := &config.Config{Models: config.Models{Default: config.ModelSpec{
+		Provider: ProviderOpenRouter, Model: "test", CredentialCommand: printer(t, "test-key", "", 0),
+	}}}
+	roles, err := BuildRolesContext(ctx, cfg)
+	if err == nil || roles != nil {
+		t.Fatalf("cancelled construction returned roles=%v err=%v", roles, err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want cancellation", err)
+	}
+}
+
+func TestBuildRolesContextKeepsCancellationForDeferredRoutes(t *testing.T) {
+	clearModelEnv(t)
+	t.Setenv(envOpenRouterAPIKey, "test-key")
+	cfg := &config.Config{Models: config.Models{Default: config.ModelSpec{Provider: ProviderOpenRouter, Model: "test"}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	roles, err := BuildRolesContext(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	deferred := config.ModelSpec{Provider: ProviderOpenRouter, Model: "route", CredentialCommand: printer(t, "route-key", "", 0)}
+	client, err := roles.Build(deferred)
+	if !errors.Is(err, context.Canceled) || client != nil {
+		t.Fatalf("cancelled route returned client=%v err=%v", client, err)
 	}
 }

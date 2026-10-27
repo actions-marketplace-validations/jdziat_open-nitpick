@@ -8,6 +8,7 @@ package vcs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -120,6 +121,10 @@ type PullRequest struct {
 	HeadRepo string
 	BaseRepo string
 
+	// SourceBaseURL is a forge-provided browse URL pinned to the head revision.
+	// Paths append to it; line anchors use the forge's #L convention.
+	SourceBaseURL string
+
 	// HeadMessage is the head commit's full message, when the provider can
 	// read it; a [skip review] marker may sit there rather than in the
 	// title or body.
@@ -183,6 +188,9 @@ type Review struct {
 	// pull request knows what has already been reviewed.
 	Head string
 
+	// Progress carries successful model results for a later retry.
+	Progress json.RawMessage
+
 	// Incomplete prevents this run from becoming an incremental baseline.
 	Incomplete bool
 
@@ -210,6 +218,9 @@ type DirLister interface {
 
 // PriorReview is what earlier runs of this tool left on a pull request.
 type PriorReview struct {
+	// Progress belongs to the latest authenticated review, including partial runs.
+	Progress json.RawMessage
+
 	// Head is the revision the most recent earlier run reviewed, or empty
 	// when no earlier run recorded one.
 	Head string
@@ -217,6 +228,12 @@ type PriorReview struct {
 	// Comments are the inline comments earlier runs published and that this
 	// tool can recognise as its own.
 	Comments []PriorComment
+
+	// Dismissed lists the fingerprints of findings whose thread this tool closed
+	// because a person's reply held. They are absent from Comments, as any
+	// resolved thread is, and named here so a later run can tell a finding that
+	// was answered from one that was merely resolved by hand.
+	Dismissed []string
 
 	// Spend totals what every earlier run recorded spending on this pull
 	// request, in US dollars. It is a sum rather than the latest value: the

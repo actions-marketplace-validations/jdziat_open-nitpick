@@ -41,7 +41,7 @@ func runRespond(ctx context.Context, args []string) error {
 	fs.BoolVar(&f.verbose, "v", false, "verbose logging")
 	fs.StringVar(&f.logFormat, "log-format", "text", "log format: text or json")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: nitpick respond [flags]\n\nAnswers a pull request comment that mentions the reviewer: \"@open-nitpick review\" reviews the whole change again,\n\"@open-nitpick resolve\" on a thread resolves it, anything else is a question answered in the thread.\nRuns inside GitHub Actions on issue_comment and pull_request_review_comment events.\n\nFlags:")
+		fmt.Fprintln(os.Stderr, "Usage: nitpick respond [flags]\n\nAnswers a pull request comment that mentions the reviewer: \"@open-nitpick review\" resumes the review,\n\"@open-nitpick restart-review\" starts a fresh review,\n\"@open-nitpick resolve\" on a thread resolves it, anything else is a question answered in the thread.\nRuns inside GitHub Actions on issue_comment and pull_request_review_comment events.\n\nFlags:")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -77,8 +77,18 @@ func runRespond(ctx context.Context, args []string) error {
 
 	kind, text, ok := converse.Command(ev.Body, mention)
 	if !ok {
-		log.Info("comment does not address the reviewer; nothing to do", "comment", ev.CommentID)
-		return nil
+		// A reply inside a thread is read without a mention, because the
+		// finding it sits under is the address. Whether that thread is one of
+		// the reviewer's own is settled below, from the forge, before anything
+		// is spent.
+		if !ev.Inline || ev.RootID == ev.CommentID || !cfg.Review.Respond.RepliesEnabled() {
+			log.Info("comment does not address the reviewer; nothing to do", "comment", ev.CommentID)
+			return nil
+		}
+		kind, text = converse.KindReply, ev.Body
+		// A reply carries no command, so there is nothing to parse again
+		// against the resolved mention below.
+		fromFile = false
 	}
 	ref, err := refForEvent(&f, ev)
 	if err != nil {
@@ -148,19 +158,35 @@ func runRespond(ctx context.Context, args []string) error {
 		}
 	}
 
-	log.Info("answering a mention", "kind", kind, "pr", ref.Number, "comment", ev.CommentID, "author", ev.Author)
+	// Before the acknowledgement, for the reason the association check is:
+	// most replies under a finding are people talking to each other, and a
+	// reaction on every one would be the reviewer listening in.
+	var finding *replyTarget
+	if kind == converse.KindReply {
+		if !policy.Review.Respond.RepliesEnabled() {
+			return nil
+		}
+		finding, err = findingBeingAnswered(ctx, gh, ref, ev, log)
+		if err != nil || finding == nil {
+			return err
+		}
+	}
+
+	log.Info("answering a comment", "kind", kind, "pr", ref.Number, "comment", ev.CommentID, "author", ev.Author)
 	if err := gh.React(ctx, ref, ev.CommentID, ev.Inline, "eyes"); err != nil {
 		log.Warn("could not acknowledge the comment", "error", err)
 	}
 
 	switch kind {
-	case converse.KindReview:
-		// The whole change, not the increment: a person asking for a review
-		// wants everything looked at again.
-		reviewArgs := []string{"-repo", f.repo, "-owner", ref.Owner, "-repo-name", ref.Repo, "-pr", strconv.Itoa(ref.Number), "-full"}
-		if f.configPath != "" {
-			reviewArgs = append(reviewArgs, "-config", f.configPath)
+	case converse.KindReply:
+		if err := runReply(ctx, gh, policy, ref, ev, finding, diffBytes, log); err != nil {
+			_ = gh.React(ctx, ref, ev.CommentID, ev.Inline, "confused")
+			return err
 		}
+		return gh.React(ctx, ref, ev.CommentID, ev.Inline, "+1")
+
+	case converse.KindReview, converse.KindRestartReview:
+		reviewArgs := mentionReviewArgs(f, ref, kind)
 		err := runReview(ctx, reviewArgs)
 		if err != nil && !errors.Is(err, errFindings) {
 			_ = gh.React(ctx, ref, ev.CommentID, ev.Inline, "confused")
@@ -307,4 +333,15 @@ func respondPolicy(ctx context.Context, provider vcs.Provider, repo string, cfg 
 	log.Warn("the change modifies the configuration; the version in the change was not applied",
 		"policy", resolved.Policy.String())
 	return resolved, raw, nil
+}
+
+func mentionReviewArgs(f reviewFlags, ref vcs.Ref, kind converse.Kind) []string {
+	args := []string{"-repo", f.repo, "-owner", ref.Owner, "-repo-name", ref.Repo, "-pr", strconv.Itoa(ref.Number)}
+	if kind == converse.KindRestartReview {
+		args = append(args, "-full")
+	}
+	if f.configPath != "" {
+		args = append(args, "-config", f.configPath)
+	}
+	return args
 }

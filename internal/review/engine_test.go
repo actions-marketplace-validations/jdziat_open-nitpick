@@ -77,12 +77,9 @@ func (s *scriptedLLM) GenerateContent(_ context.Context, msgs []llms.Message, _ 
 			return &llms.Response{Content: response}, nil
 		}
 	}
-	// A fallback is written for the review pass, and the triage pass has a
-	// different shape. Answering triage with a review-shaped reply is not a
-	// no-op: every verdict names no finding, so triage is skipped entirely and
-	// a test that meant "triage is not the subject here" has quietly stopped
-	// exercising it. An empty verdict list says the same thing truthfully, and
-	// the findings restore.
+	// A fallback is written for the review pass. A review-shaped reply to
+	// triage names no finding in any verdict, which skips triage entirely, so
+	// answer with an empty verdict list and let the findings restore.
 	if strings.Contains(text, "triaging findings") && !strings.Contains(s.fallback, `"number"`) {
 		return &llms.Response{Content: `{"findings":[],"summary":""}`}, nil
 	}
@@ -630,7 +627,7 @@ func TestRenderCommentIncludesSuggestionBlock(t *testing.T) {
 	if !strings.Contains(body, "```suggestion\n") {
 		t.Errorf("a single-line code suggestion should render as an applicable block:\n%s", body)
 	}
-	if !strings.Contains(body, "warning") {
+	if !strings.Contains(body, "Warning") {
 		t.Errorf("severity should be visible:\n%s", body)
 	}
 }

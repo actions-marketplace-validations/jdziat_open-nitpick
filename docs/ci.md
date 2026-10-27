@@ -31,15 +31,19 @@ jobs:
           fetch-depth: 0        # the reviewer needs history to diff against base
       - uses: jdziat/open-nitpick@v1
         with:
-          provider: synthetic
-          model: hf:moonshotai/Kimi-K3
-          api-key: ${{ secrets.SYNTHETIC_API_KEY }}
+          provider: openrouter
+          model: z-ai/glm-5.3-flash
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
           # Omit fail-on (or set it to none) until you have seen how the model
           # behaves on your codebase. A reviewer that blocks merges on its first
           # false positive is a reviewer the team switches off.
           fail-on: none
+          dry-run: true  # inspect the summary before allowing publication
           skip-drafts: true
 ```
+
+The first run is intentionally non-publishing. Inspect the job summary, then
+remove `dry-run: true` when the configuration and results are ready to publish.
 
 ### Talking to it
 
@@ -51,25 +55,36 @@ A comment on the pull request that starts with
 ```yaml
 name: Respond
 on:
-  issue_comment: {types: [created]}
-  pull_request_review_comment: {types: [created]}
-permissions: {contents: read, pull-requests: write, issues: write}
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 jobs:
   respond:
-    if: contains(github.event.comment.body, '@open-nitpick')
+    if: >-
+      (contains(github.event.comment.body, '@open-nitpick') ||
+       github.event.comment.in_reply_to_id != null) &&
+      github.event.comment.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: {fetch-depth: 0}
+        with:
+          fetch-depth: 0
       - uses: jdziat/open-nitpick@v1
         with:
           command: respond
-          provider: synthetic
-          model: hf:moonshotai/Kimi-K3
-          api-key: ${{ secrets.SYNTHETIC_API_KEY }}
+          provider: openrouter
+          model: z-ai/glm-5.3-flash
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-`@open-nitpick review` reviews the whole change again, not the increment.
+`@open-nitpick review` resumes the previous review, or starts one if none exists.
+`@open-nitpick restart-review` reviews the whole PR afresh. The older `re-review`
+and `rereview` aliases also restart.
 `@open-nitpick resolve` on an inline thread resolves it with a reply naming who
 asked. `@open-nitpick improve` runs the wider pass, below. Anything else is a
 question, answered in the same thread by the
@@ -79,6 +94,26 @@ comment cannot instruct the model. The comment gets an eyes reaction when
 the run starts and a thumbs-up when it has answered. The handle is
 `review.mention` in `.nitpick.yaml`. This repository's own is
 [.github/workflows/nitpick-respond.yml](https://github.com/jdziat/open-nitpick/blob/main/.github/workflows/nitpick-respond.yml).
+
+### Replying to a finding
+
+Every inline finding ends with an invitation to reply. A reply under it needs
+no mention: the reviewer reads it with the finding, the diff and the lines
+around the thread, and either resolves the thread with a short reason or says
+what would settle it. A reply that only asserts, or that asks it to approve,
+leaves the thread open. A finding it resolved this way is not posted again on
+later pushes; a thread someone resolved by hand can come back if the code still
+shows the problem.
+
+Replies pass through the same gates as a mention: `review.respond.from` and
+`max_per_pull_request`. To start a run on a reply, the workflow's `if:` also
+accepts any comment with `in_reply_to_id` from an account that is not a bot;
+the run stops before spending any model credit when the thread was not started
+by the reviewer. A runner still starts for each such reply, because an `if:`
+expression cannot see who began the thread, so a busy pull request costs a
+short run per reply. `review.respond.replies: false` makes `nitpick respond`
+ignore replies and drops the invitation from new comments; removing the
+`in_reply_to_id` clause from the `if:` stops the runner starting for them.
 
 ### Superseded comments
 
@@ -99,38 +134,34 @@ own.
 
 ### Posting as your own GitHub App
 
-With the job token the review is posted
-by `github-actions[bot]`. A GitHub App gives it a name and an avatar of your
-choosing, its own permissions, and reviews that count as a reviewer's in
-the pull request sidebar. Create one under your account or organisation
-(Settings, Developer settings, GitHub Apps): no webhook, repository
-permissions Contents read, Metadata read, Pull requests read and write;
-install it on the repositories to review; generate a private key. Save the
-App ID as a repository secret `NITPICK_APP_ID` and the key file's
-contents as a secret `NITPICK_APP_PRIVATE_KEY` (GitHub refuses secret names
-that start with `GITHUB_`). Then mint the token in the job and hand it to
-the Action:
+With the job token the review is posted by `github-actions[bot]`. A GitHub App
+has its own identity and repository permissions. Create and install an App with
+Contents read, Metadata read, and Pull requests read and write; it does not need
+a webhook. Save its **installation ID** and private key as repository secrets.
+
+The Action can mint and refresh its own installation tokens. This avoids handing
+it a one-hour static token, which can expire before a long review publishes:
 
 ```yaml
-    env:
-      NITPICK_APP_ID: ${{ secrets.NITPICK_APP_ID }}   # a step's if cannot read secrets, only env
-    steps:
-      - name: Token for the review app
-        id: app
-        if: env.NITPICK_APP_ID != ''
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ env.NITPICK_APP_ID }}
-          private-key: ${{ secrets.NITPICK_APP_PRIVATE_KEY }}
       - uses: jdziat/open-nitpick@v1
+        env:
+          NITPICK_APP_ID: ${{ vars.NITPICK_APP_ID }}
         with:
-          github-token: ${{ steps.app.outputs.token || github.token }}
+          app-installation-id: ${{ secrets.NITPICK_APP_INSTALLATION_ID }}
+          app-private-key: ${{ secrets.NITPICK_APP_PRIVATE_KEY }}
+          bot-login: ${{ vars.NITPICK_APP_SLUG }}[bot]
+          provider: openrouter
+          model: z-ai/glm-5.3-flash
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-The `if` and the `||` make the App optional: a repository without the
-secret posts with the job token as before. The token the step mints
-lasts an hour and is scoped to the installation, so the workflow's
-`permissions` block still governs only the default token.
+Set `NITPICK_APP_ID` and `NITPICK_APP_SLUG` as repository variables and both App
+inputs as secrets. The current action reads `NITPICK_APP_ID` to enable its
+refreshable App credentials, and the example builds `bot-login` from
+`NITPICK_APP_SLUG`. `bot-login` must be the App slug followed by `[bot]`, and lets
+the reviewer recognize its own earlier work. Use the default `github-token`
+instead when an App identity is not needed. The job’s `permissions` still
+control the default token; the App token uses the App’s installation permissions.
 
 ### Inputs
 
@@ -141,21 +172,24 @@ than the repository root.
 
 | input | default | what it does |
 |---|---|---|
-| `github-token` | `${{ github.token }}` | reads the pull request and publishes the review. Needs `pull-requests: write`. On a pull request from a fork it is read-only, so nothing is posted; see [Forks](#forks) for what a fork run does and does not do |
-| `config` | `.nitpick.yaml` | path to the configuration file, relative to the workspace |
-| `provider` | from the config file | overrides `models.default.provider`; `nitpick providers` prints the list |
-| `model` | from the config file | overrides `models.default.model` |
-| `bot-login` | `github-actions[bot]` | trusted posting account; set `<app-slug>[bot]` for an App token, or the account name for a personal token |
-| `api-key` | none | the provider's key. Pass a secret, never a literal. Ignored where the provider reads its own conventional variable |
-| `fail-on` | from `review.fail_on` | lowest severity that fails the job: `nit`, `info`, `warning`, `error`, `critical`, or `none` |
-| `instruction` | none | one extra instruction, applied to this run only |
-| `pr-number` | the triggering pull request | set it on `workflow_dispatch` and `issue_comment` runs |
-| `dry-run` | `false` | print the review to the log and the job summary instead of publishing it |
-| `skip-drafts` | `false` | do nothing on a draft pull request |
-| `version` | `latest` | a release tag such as `v1.0.0`, or `latest`. See the paragraph below for what happens when no release matches |
-| `analyzers` | empty | catalog names to install on the runner before the review, comma separated, or `auto` for the ones the change's languages call for. Empty installs nothing and the review runs whatever the runner already has |
-| `command` | `review` | `review` reviews the pull request; `respond` answers a comment that mentioned the reviewer |
-| `args` | none | flags passed verbatim to `nitpick review`, for anything with no input of its own |
+| `bot-login` | `github-actions[bot]` | account whose earlier reviews may be reused; use `<app-slug>[bot]` with App credentials |
+| `github-token` | `${{ github.token }}` | reads the pull request and publishes the review. Needs `pull-requests: write`; fork tokens cannot publish |
+| `app-installation-id` | none | GitHub App installation ID. With `app-private-key` and `NITPICK_APP_ID` in the calling step environment, mints replacement tokens before expiry during a long run |
+| `app-private-key` | none | GitHub App private key. Set only with `app-installation-id`, as a secret |
+| `config` | `.nitpick.yaml` | configuration path relative to the workspace |
+| `provider` | config | overrides `models.default.provider`; `nitpick providers` lists providers |
+| `model` | config | overrides `models.default.model` |
+| `api-key` | none | provider key; pass a secret, never a literal |
+| `fail-on` | `review.fail_on` | lowest severity that fails: `nit`, `info`, `warning`, `error`, `critical`, or `none` |
+| `instruction` | none | one extra instruction for this run |
+| `pr-number` | triggering pull request | set for `workflow_dispatch` and comment events |
+| `dry-run` | `false` | writes to log and job summary without publishing |
+| `skip-drafts` | `false` | skips draft pull requests |
+| `allow-degraded-triage` | `false` | when only triage failed, publishes the findings, applies `fail-on` and reports `result: degraded` instead of exiting 2 |
+| `version` | `latest` | release tag or `latest`; falls back to building the Action checkout when its release is unavailable |
+| `analyzers` | empty | catalog names to install, comma separated; `auto` selects ones for changed languages; empty uses runner tools |
+| `command` | `review` | `review`, `fast-review`, or `respond` |
+| `args` | none | flags passed to `review` and `fast-review` |
 
 ### What a run does
 
@@ -169,10 +203,16 @@ step sets outputs a later step can read:
 
 | output | value |
 |---|---|
-| `result` | `clean`, `findings` (the gate was tripped), `skipped` (a draft), or `error` (the review could not run) |
-| `findings`, `critical`, `error`, `warning` | counts of what was published |
+| `result` | `clean`, `findings`, `skipped`, `degraded` or `error`. A completeness failure is `error`, not a clean review; `degraded` appears only with `allow-degraded-triage`. |
+| `findings` | number of findings published |
+| `practice_findings` | practice-report findings, including advisory findings and accepted exceptions; may overlap inline findings |
+| `practice_blocking` | engineering-policy violations without an accepted exception or unresolved uncertainty |
+| `critical`, `error`, `warning` | findings at each severity |
 | `files` | files reviewed |
-| `withheld` | findings an earlier review had already posted |
+| `withheld` | findings not republished because an earlier review already posted them |
+| `complete` | whether the selected policy’s required assessment completed |
+| `failed_stages` | comma-separated model stages that did not complete; empty when none did |
+
 
 Exit codes: `0` clean, `1` findings at or above `fail_on`, `2` the review could
 not run. CI can tell "this change has problems" apart from "the reviewer
@@ -200,8 +240,7 @@ the hosted reviewers do implicitly; here it is a line in the workflow.
 ### Try it first
 
 `dry-run: true` prints the review to the log and the job
-summary and posts nothing. `nitpick explain-config` shows the prompt a path
-would get before a token is spent.
+summary and posts nothing. `nitpick explain-config` shows the resolved configuration for a path without running a model.
 
 ### Events
 
@@ -238,13 +277,31 @@ saying so is more use than a workaround that leaks the key.
 
 ### Incremental review
 
-After a completed review with no standing findings, a later push is reviewed
-incrementally: only files changed since that review are read. While earlier
-findings remain, the whole change is rechecked. Confirmed findings affect the
-failure gate even when their comments are withheld from reposting. The review says which files it read and how many
-findings it withheld. A force push that makes the earlier revision
-unreachable reviews the whole change again. `review.incremental: false`
-reviews the whole change on every push.
+A review reuses successful model requests from its latest published review when
+the prompts, code and related context, model settings, and resolved policy still
+match. Failed requests retry. New commits rerun affected batches; unchanged
+batches keep their results. Changing one file can invalidate its whole batch or
+another batch that includes it as context.
+
+A push is also scoped before batching: only the files that changed since the
+last reviewed head are read, widened to include any file still carrying an
+unresolved comment from an earlier run, so that comment can still be verified
+or closed. A file that neither changed nor carries a standing comment is left
+alone; its earlier findings still stand. Scoping falls back to the whole
+change whenever the comparison itself is unavailable: no earlier head, no
+provider that can answer it, or a force push that made the earlier head
+unreachable.
+
+Analyzers, triage, validation, and approval run again over the combined results.
+Earlier findings still count, and unresolved threads still prevent approval.
+The summary reports how many model requests were reused. `review.incremental:
+false` disables reuse; `nitpick review -full` and `@open-nitpick restart-review`
+bypass it for one run.
+
+Progress is stored in the review on GitHub, so a new Actions runner can resume.
+Legacy reviews without these records start fresh. Records are bounded to fit
+GitHub's review body limit; omitted results are reviewed again. A run that never
+publishes a review does not save new progress.
 
 How a finding is recognised as already posted: every comment carries a
 fingerprint of its path, class and title, and a review carries the revision it
@@ -280,14 +337,15 @@ pull request number are detected automatically.
 ### Review identity and retries
 
 The Action's `bot-login` input identifies the account whose review history may
-be reused. For an App token, set it to the app slug followed by `[bot]`, for
-example `${{ format('{0}[bot]', steps.app.outputs.app-slug) }}`. For the CLI,
+be reused. For an App token, set it to the app slug followed by `[bot]`, as the
+App example above does with `${{ vars.NITPICK_APP_SLUG }}[bot]`. For the CLI,
 set `NITPICK_BOT_LOGIN`; personal tokens can leave it unset to resolve their
 authenticated user. A comment's HTML markers alone establish no identity.
 
 Only completed reviews carrying the completion marker can be reused. Legacy
 reviews and failed runs trigger a full review. While earlier findings remain,
-the whole change is rechecked; confirmed findings still affect `fail_on` even
+the files that carry them are rechecked alongside whatever changed; confirmed
+findings still affect `fail_on` even
 when their comments are not posted twice. Strict analyzer failures exit 2.
 
 On `merge_group`, the Action reviews the event's base/head SHAs as a local

@@ -8,14 +8,14 @@ Start anywhere in it. `nitpick init` comes first here because a repository is
 usually set up once, but it is optional: a review runs with no config file at
 all as long as `LLM_PROVIDER` and `LLM_MODEL` are set, and every command below
 works that way. All of them assume `nitpick` is on your PATH; the
-[Quick start](../README.md#quick-start) has the one-line install, and
+[Quick start](getting-started.md#1-install-the-cli) has the one-line install, and
 [Providers and models](providers.md) covers what to set those two variables to.
 
 ## Starting a repository off
 
 ```bash
 nitpick init                            # writes .nitpick.yaml here
-nitpick init -provider synthetic -model hf:zai-org/GLM-5.3-Flash
+nitpick init -provider openrouter -model z-ai/glm-5.3-flash
 nitpick init -workflow                  # also .github/workflows/nitpick.yml
 nitpick init -force                     # overwrite an existing file
 ```
@@ -58,12 +58,29 @@ line reporting `model: none`, and the file it wrote is not yet runnable.
 nitpick review                          # uncommitted changes
 nitpick review -base main               # working tree against main
 nitpick review -base main -head feature # a committed branch
+nitpick fast-review                     # changed diffs, top ten findings
 nitpick explain-config -path src/db.go  # what would be sent, and why
 nitpick providers                       # available model providers
 ```
 
 Local reviews print to stdout as `path:line`, which most terminals and editors
 turn into a clickable link.
+
+Fast review reads every eligible changed-file diff and publishes up to ten
+findings, ranked by severity. Requests carry up to four diffs, and concurrency
+is selected by provider: eight for OpenRouter, six for DeepSeek, Fireworks,
+Together AI, Groq and Cerebras, four for other hosted providers, and two for
+Ollama and llama.cpp. Account-specific rate limits can be lower.
+
+With no model configured it selects `deepseek/deepseek-v4.1-flash` over
+OpenRouter, needing `OPENROUTER_API_KEY`. It aims for feedback in under a minute
+through parallel diff-only requests, disabled reasoning, and a 4096-token
+output cap. There is no hard wall-clock ceiling; provider timeouts still apply.
+It skips related repository context, linters, validation and model triage,
+and refuses the engineering profile. Its receipt discloses omissions and
+lower-ranked findings withheld from the top ten. It never supplies an
+incremental baseline, closes earlier threads, or approves a pull request;
+use `nitpick review` for a complete review.
 
 ## Evaluate repository standards
 
@@ -175,6 +192,42 @@ It is off by default, needs a local checkout for git to read the base revision
 in, and needs a base revision to read. Without either the run says which and
 reviews without it, and the report records that rather than leaving an absent
 section to be read as a repository with no conventions.
+
+## Flow diagrams
+
+Setting `review.flow: true` adds a collapsed Mermaid diagram to the
+walkthrough showing how the functions a change edits are reached and what they
+reach: callers up to four hops, as far as an entry point such as a command's
+main function, and callees down two hops, ending at calls into the operating
+system, the network or a third-party package. Edited functions, entry points
+and external effects are coloured apart.
+
+Every arrow and declaration is listed beneath the diagram with a link to its
+line at the reviewed revision, when the forge supplies a browse URL. A solid
+arrow is a call by name or through an import. A dashed arrow labelled
+*inferred* is a method matched by name alone, because one method in scope has
+that name. One labelled *unresolved* matches several methods and is drawn as an
+ambiguous box in place of a guess. The diagram also lists what it could not
+see: files that import reflect or plugin, generated code, and Go files that did
+not parse.
+
+A route registered with a router verb and a path literal, such as
+mux.HandleFunc("GET /users", auth, list) or r.Post("/users", auth, create), is
+drawn as a green box whose arrows run to its handlers, numbered in the order
+they run, so a change to a handler shows the chain it sits in. Calls that write
+to the filesystem or reach a database package such as database/sql are pink.
+Because the graph has no types, a database-shaped method name like Query in a
+file that imports one is drawn as inferred. Middleware named in a Use call
+runs first in the chain of every route registered on that router afterwards. A
+group made with Group starts with the middleware its parent had at that point,
+and what the group adds stays in the group. Middleware passed to Use in a form
+the graph cannot name, and handlers it cannot name, are listed as limits.
+
+The graph is built from Go source by name, without type checking. A call
+through an interface or a package-level table is not drawn, so a missing arrow
+does not prove there is no call. A diagram stops at 30 nodes and says so. It is
+off by default, appears even with `review.summary: false`, and covers Go only;
+Routes are found by shape, not per framework.
 
 A language no probe reads is named in the report rather than left out of it.
 Six probes read Go today and nothing reads anything else, so a TypeScript tree
@@ -288,10 +341,15 @@ much each would remove. The tells need no model and run first.
 | `shouting-emphasis` | capitals doing a sentence's work: NOT, MUST, WHOLE |
 | `changelog-comment` | a comment narrating what the code used to do |
 | `prose-cadence` | a file written in one rhythm, measured over the file |
+| `contrast-heading` | a heading or card title that names what it is not |
+| `slogan-heading` | a heading that sells: "written down", "done right" |
+| `stock-word` | `seamless`, `robust`, `leverage`, `comprehensive` |
+| `summary-opener` | a sentence opened with "Overall," or "In summary," |
+| `not-just-but` | "not just X but Y" |
 
 Prose files are scanned whole. Source files are scanned in their comments only,
 so a string literal is never a tell. Then,
-unless `-no-model`, the model's nine slop rules run through the review
+unless `-no-model`, the model's twelve slop rules run through the review
 engine over the same paths, filtered to the slop class, with the
 suggestions the model gave; findings it made outside that class are
 listed rather than dropped, since they were paid for. `-fail-over N`
@@ -320,14 +378,16 @@ same engine; absolute `repo` paths are trusted-operator-only. See
 
 `review.slop: true` asks the model for, and publishes, findings in a tenth
 class, `slop`: code that reads as generated and left unread, where the cost
-to the next reader can be named. It is nine rules a reader can check on the
+to the next reader can be named. It is twelve rules a reader can check on the
 line, each with the lookalike it excludes: a comment that restates the line
 below it; a comment describing behaviour the code lacks; dead code beside
 its replacement; a check against a condition the types exclude; an error
 swallowed and carried on from; generic naming where the file has a specific
 word; boilerplate repeated three times where the language has the
 abstraction; prose that addresses the reader as a chat reply; a test that
-asserts nothing. The rules are the prompt layer `prompt.SlopGuidance`, and
+asserts nothing; a heading that sells instead of naming; marketing words where
+a fact would do; a blurb that retells the page it links to. The rules are the
+prompt layer `prompt.SlopGuidance`, and
 `nitpick explain-config` prints them when the switch is on.
 
 It is off by default in a review, whatever the nitpick level, and on in
@@ -350,8 +410,12 @@ nitpick review -profile engineering -base main
 nitpick commits -base main -check
 ```
 
-`repo-standards` examines the selected working tree; `review` examines changed
-files with available related context. `-base` also selects the accepted repository
+`repo-standards` examines the selected working tree. Engineering `review` plans
+focused assessments for changed Go declarations and callers within two hops,
+with selected implementations and package contracts as context. Tasks in the
+same package can share a request within file, token and task limits. Full-source
+slop assessments have separate completion obligations. Other languages receive
+source tasks with graph limitations stated in the report. `-base` also selects the accepted repository
 policy and the commit range. An external `-config` file is operator policy.
 Repository configuration edits cannot weaken their own checks.
 
@@ -371,6 +435,15 @@ The engineering tree scan runs models. `-no-model` provides
 deterministic results but leaves required slop and design assessments unavailable.
 `-budget` limits estimated source tokens for the tree model pass; omitted targets
 remain visible. It is not a monetary spending limit.
+
+Design tasks use a frozen, bounded source snapshot. Missing source and tasks
+that exceed file, token or spending limits remain incomplete; separate successful
+requests containing the same files do not establish task completion. Expert
+validation keeps the complete task context or records that it exceeded the
+prompt limit. Context-only findings appear in the summary, with revision-pinned
+source links when the forge supplies them. Cancellation preserves completed task
+evidence and marks unfinished stages. These are coverage records, not a claim
+that every architectural defect was ruled out.
 
 The initial policy requires completion of conventions, linters, commits, slop
 tells, slop assessment and design assessment. Commit and analyzer violations
@@ -435,3 +508,11 @@ provider failures stay visible, and a passing policy gate does not mean these
 assessments completed. The paired controls in `docs/findings.md` do not justify
 blocking merges on model judgments. Deterministic prose tells also remain
 advisory while their existing findings are assessed.
+
+### Resume or restart a pull request review
+
+Comment `@open-nitpick review` to retry unfinished work and reuse successful
+model requests whose inputs still match. With no previous review, it starts a
+new one. Comment `@open-nitpick restart-review` to start fresh, or use
+`nitpick review -owner OWNER -repo-name REPO -pr NUMBER -full` from the CLI.
+See [incremental review](ci.md#incremental-review) for reuse and approval rules.

@@ -53,6 +53,9 @@ type Client struct {
 	// batch, and a config that lowers one has no reason to want the other.
 	stallRetries int
 
+	// clock replaces time.Now for the retry budget. Nil outside tests.
+	clock func() time.Time
+
 	// fallback is the client a caller escalates to when this one cannot
 	// answer. Nil when the spec names none. See ShouldEscalate.
 	fallback *Client
@@ -318,25 +321,31 @@ func (r *Roles) Validator() *Client {
 // front means a misconfigured triage or validation model fails immediately
 // rather than after the expensive review calls have already been paid for.
 func BuildRoles(cfg *config.Config) (*Roles, error) {
-	review, err := Build(cfg.Models.ResolveModel(config.RoleReview))
+	return BuildRolesContext(context.Background(), cfg)
+}
+
+// BuildRolesContext bounds credential resolution for every role by ctx.
+func BuildRolesContext(ctx context.Context, cfg *config.Config) (*Roles, error) {
+	build := func(spec config.ModelSpec) (*Client, error) { return BuildContext(ctx, spec) }
+	review, err := build(cfg.Models.ResolveModel(config.RoleReview))
 	if err != nil {
 		return nil, fmt.Errorf("review model: %w", err)
 	}
 
-	triage, err := Build(cfg.Models.ResolveModel(config.RoleTriage))
+	triage, err := build(cfg.Models.ResolveModel(config.RoleTriage))
 	if err != nil {
 		return nil, fmt.Errorf("triage model: %w", err)
 	}
 
-	validate, err := Build(cfg.Models.ResolveModel(config.RoleValidate))
+	validate, err := build(cfg.Models.ResolveModel(config.RoleValidate))
 	if err != nil {
 		return nil, fmt.Errorf("validation model: %w", err)
 	}
 
-	roles := &Roles{Review: review, Triage: triage, Validate: validate, Build: Build}
+	roles := &Roles{Review: review, Triage: triage, Validate: validate, Build: build}
 
 	if spec, ok := cfg.Models.ResolveRouter(); ok && cfg.Models.NeedsRouter() {
-		if roles.Router, err = Build(spec); err != nil {
+		if roles.Router, err = build(spec); err != nil {
 			return nil, fmt.Errorf("router model: %w", err)
 		}
 	}
@@ -372,7 +381,28 @@ func (c *Client) CallOptions() []llms.CallOption {
 	if r, ok := reasoningOption(c.Spec.Reasoning); ok {
 		opts = append(opts, r)
 	}
-	if len(c.Spec.Providers) > 0 {
+	if strings.EqualFold(c.Spec.Provider, "openrouter") {
+		if c.Spec.Reasoning == config.ReasoningOff {
+			// The SDK's neutral switch emits thinking.type, while OpenRouter
+			// routes its own reasoning.enabled field to upstream providers.
+			opts = append(opts, llms.WithExtraBodyParam("reasoning", map[string]any{"enabled": false}))
+		}
+		// OpenRouter routes each request to whichever endpoint it likes, and
+		// many ignore parameters they do not support. require_parameters
+		// makes the router pick an endpoint that honours reasoning and
+		// max_tokens, so a caller who asked for no reasoning gets a provider
+		// that obeys instead of one that thinks for minutes and answers in
+		// truncated prose. Pins restrict the same routing request.
+		routing := map[string]any{
+			"require_parameters": true,
+		}
+		if len(c.Spec.Providers) > 0 {
+			routing["only"] = append([]string(nil), c.Spec.Providers...)
+			routing["allow_fallbacks"] = false
+		}
+		opts = append(opts, llms.WithExtraBodyParam("provider", routing))
+	}
+	if len(c.Spec.Providers) > 0 && !strings.EqualFold(c.Spec.Provider, "openrouter") {
 		// OpenRouter's provider routing. "only" restricts the candidate set;
 		// "order" ranks whatever set the other filters leave, which is not the
 		// same thing and was the bug. With order plus allow_fallbacks false,
@@ -405,7 +435,6 @@ func (c *Client) CallOptions() []llms.CallOption {
 	if tier := strings.TrimSpace(c.Spec.ServiceTier); tier != "" {
 		opts = append(opts, llms.WithExtraBodyParam("service_tier", tier))
 	}
-
 	return opts
 }
 

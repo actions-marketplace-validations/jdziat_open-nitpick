@@ -23,6 +23,7 @@ import (
 	"github.com/jdziat/open-nitpick/internal/config"
 	"github.com/jdziat/open-nitpick/internal/diff"
 	"github.com/jdziat/open-nitpick/internal/fence"
+	"github.com/jdziat/open-nitpick/internal/flow"
 	"github.com/jdziat/open-nitpick/internal/llm"
 	"github.com/jdziat/open-nitpick/internal/practices"
 	"github.com/jdziat/open-nitpick/internal/prompt"
@@ -32,6 +33,22 @@ import (
 // Engine reviews changes. It is the library the CLI drives, and the same one a
 // future webhook server would drive.
 type Engine struct {
+	// FastLimit caps published findings for a bounded first pass. Zero keeps
+	// every finding, which is the ordinary review contract.
+	FastLimit int
+
+	// FastReview marks a bounded first pass. It does not provide reusable
+	// coverage, resolve prior threads, or approve a pull request.
+	FastReview bool
+
+	// SkipTriage avoids the model triage pass. With FastReview the receipt
+	// names the omission; on its own it publishes untriaged findings silently.
+	SkipTriage bool
+
+	// RequestTimeout bounds one model request independently of the caller's
+	// overall context. Zero leaves the configured client timeout in control.
+	RequestTimeout time.Duration
+
 	// AssessPractices attaches engineering evidence before rendering and gating.
 	// Nil leaves the existing review policy in control.
 	AssessPractices func(context.Context, vcs.Ref, *vcs.PullRequest, *Report) *practices.Report
@@ -73,7 +90,13 @@ type Engine struct {
 
 	// routeDecisions is where each batch of the last review went; copied
 	// into the Report.
-	routeDecisions []RouteDecision
+	routeDecisions      []RouteDecision
+	assessedDesignTasks []string
+
+	// priorReadErr is the last PriorReview failure from this run, so residual
+	// can hold COMMENT without a second forge round trip after incremental
+	// already paid for a failed read.
+	priorReadErr error
 
 	// Linters supplies deterministic findings to merge with the model's.
 	//
@@ -97,8 +120,18 @@ type Engine struct {
 	// SkipDraft is the operator flag for leaving draft pull requests alone.
 	SkipDraft bool
 
-	// Full bypasses incremental history on an explicit operator request.
+	// Full bypasses result reuse on an explicit operator request.
 	Full bool
+
+	// Resume reuses successful model requests while rerunning downstream checks.
+	Resume   bool
+	progress *reviewProgress
+
+	// standingOnly names files pulled into this run's scope solely to
+	// recheck an open comment, set from Incremental.StandingOnly right after
+	// narrowing. analyzeBatchWith reads it to keep the progress cache from
+	// answering for a batch holding one of them.
+	standingOnly map[string]bool
 }
 
 // LinterRunner produces deterministic findings for the changed files.
@@ -149,7 +182,7 @@ type LinterDiscard struct {
 // They are separate values rather than one string because a reader has to sort
 // this repository's own publication policy from something having gone wrong, and
 // the counts are published together. Two of these are policy working exactly as
-// configured; the third is not a policy outcome at all.
+// configured; the other two are not a policy outcome at all.
 type DiscardReason string
 
 // The reasons an analyzer finding is not published.
@@ -370,6 +403,28 @@ const (
 
 // Report is the outcome of a review.
 type Report struct {
+	// Elapsed measures pipeline work before the result is returned.
+	Elapsed time.Duration
+	// FastReview identifies a bounded diff-only pass. Its receipt names the
+	// omitted stages and any files that could not be reviewed.
+	FastReview bool
+	// FastLimit records the finding ceiling used for the bounded pass.
+	FastLimit int
+
+	// OmittedFindings counts findings that ranked below FastLimit.
+	OmittedFindings int
+
+	// UnpublishedModelFindings retains claims whose source locations were unsupported.
+	UnpublishedModelFindings []Finding
+	// DesignExecution binds package assessment to its frozen source and task plan.
+	DesignExecution *DesignExecution `json:"-"`
+	// AssessedDesignTasks identifies package requests that completed successfully.
+	AssessedDesignTasks []string
+	// Progress carries successful model results; downstream checks run again.
+	Progress json.RawMessage
+	// ReusedRequests counts model requests recovered from an earlier review.
+	ReusedRequests int
+
 	// Practices records selected engineering checks alongside the code review.
 	Practices *practices.Report
 	// ModelUsage retains reported usage independently of findings and gating.
@@ -429,6 +484,10 @@ type Report struct {
 	// Standards is what the convention measurement did on this run: off,
 	// active or skipped, with a reason.
 	Standards StandardsStatus
+
+	// Flow is the call-flow diagram for the edited functions, nil when
+	// review.flow is off or nothing connected was found.
+	Flow *flow.Diagram
 
 	// Escalated records the batches a fallback model reviewed after the
 	// primary could not, so a reader can tell which findings came from which
@@ -504,6 +563,29 @@ type Report struct {
 	// how many, so a push whose only defects were already on the pull request
 	// does not read as a push that introduced none.
 	AlreadyReported []Finding
+
+	// Dismissed lists findings this run produced that a person had already
+	// answered, and the reviewer had accepted the answer by closing the
+	// thread. They are not posted again.
+	Dismissed []Finding
+
+	// ResidualApprove is set when the residual judge allows APPROVE despite
+	// published low-severity findings. reviewEvent reads it; it never calls
+	// the model.
+	ResidualApprove bool
+
+	// ResidualReason is the judge's short rationale, for logs only.
+	ResidualReason string
+
+	// prior is the earlier review. Incremental narrowing may load it first;
+	// residual approve loads it when incremental is off so withhold and
+	// standing-thread gates see the same prior.
+	prior *vcs.PriorReview
+
+	// priorReadFailed is set when residual needed the prior and the provider
+	// that can answer PriorReview returned an error. Residual must hold
+	// COMMENT rather than retrying after the judge and greenwashing a miss.
+	priorReadFailed bool
 }
 
 // Incremental describes a run that reviewed part of a change because an
@@ -512,13 +594,29 @@ type Incremental struct {
 	// Since is the revision the earlier review looked at.
 	Since string
 
-	// Reviewed and Unchanged are the changed files this run read and the
-	// ones it did not, because nothing in them moved since Since.
+	// Reviewed and Unchanged are the files this run read and the ones it did
+	// not. Reviewed holds every file that changed since Since, plus any file
+	// that did not but still carries a comment from an earlier run (Recheck).
 	Reviewed  []string
 	Unchanged []string
 
-	// Recheck means standing findings required another review of the whole change.
+	// Recheck means an earlier run's comments are still standing, so Reviewed
+	// was widened to include the files carrying them. Reviewed may still be
+	// smaller than the whole change; Unchanged says what, if anything, that
+	// widening left out.
 	Recheck bool
+
+	// StandingOnly is the subset of Reviewed pulled into scope solely to
+	// recheck an open comment, on content that did not itself change: empty
+	// means either no recheck ran or the run could not compare revisions, so
+	// it cannot say any file's content was unchanged. The
+	// progress cache must not answer for these: its key is a hash of the
+	// batch's rendered content, which an unchanged file reproduces exactly,
+	// so a cache hit here would replay the same verdict the open comment
+	// already carries rather than asking the model again. superseded and
+	// resolveClearedForApprove can then never see a finding stop recurring,
+	// and the thread stays open regardless of whether it still applies.
+	StandingOnly map[string]bool
 }
 
 // StageStatus records a required stage that did not complete.
@@ -549,11 +647,31 @@ func (r *Report) PipelineComplete() bool {
 }
 
 // reusableCoverage requires completed work for every file the policy included.
+//
+// r.Plan.Skipped is read only when DesignExecution is nil. Under the
+// engineering profile, assembleDesign assigns r.Plan the design-task packing
+// plan built by PackDesign, and its Skipped entries name a design task's own
+// budget decision ("exceeds review.max_files_per_request") rather than a file
+// the plain code review left unread. Treating that as unreviewed repeated the
+// bug #143 fixed in reviewAnalyzerCheck: a single skipped design task made
+// this withhold the completion marker and block superseded and
+// resolveClearedForApprove from resolving threads for a run whose actual file
+// coverage completed.
 func (r *Report) reusableCoverage() bool {
+	// Fast review is an intentionally reduced first pass. It may be useful
+	// immediately, but must never stand in for a complete review on a later
+	// push or authorize closing an earlier finding.
+	if r.FastReview {
+		return false
+	}
+	// Skipped pull requests provide no coverage even without failed stages.
+	if r.Skipped != "" {
+		return false
+	}
 	if !r.PipelineComplete() {
 		return false
 	}
-	if r.Plan != nil {
+	if r.Plan != nil && r.DesignExecution == nil {
 		for _, skip := range r.Plan.Skipped {
 			switch skip.Reason {
 			case bundle.ReasonIgnored, bundle.ReasonGenerated, bundle.ReasonBinary, bundle.ReasonDeleted, bundle.ReasonNoChanges:
@@ -564,6 +682,23 @@ func (r *Report) reusableCoverage() bool {
 	}
 	return true
 }
+
+// unreadFileSkips answers the same question as reusableCoverage's loop above,
+// for superseded and resolveClearedForApprove to withhold from thread
+// resolution: it excludes a design-task packing skip the same way, since
+// that names a task's own budget decision, not a file the review left
+// unread.
+func (r *Report) unreadFileSkips() []bundle.Skip {
+	if r.Plan == nil || r.DesignExecution != nil {
+		return nil
+	}
+	return r.Plan.Skipped
+}
+
+// ReusableCoverage reports whether this result can act as coverage for a later
+// review. It is exported for command surfaces that must distinguish a bounded
+// fast pass from a clean full review.
+func (r *Report) ReusableCoverage() bool { return r.reusableCoverage() }
 
 // FailedStages names the stages that did not complete, for an output that
 // carries one line.
@@ -592,6 +727,7 @@ func (r *Report) Failed(failOn config.Severity) bool {
 
 // Review runs the full pipeline and publishes the result.
 func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
+	started := time.Now()
 	if err := e.validate(); err != nil {
 		return nil, err
 	}
@@ -675,19 +811,64 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	}
 	e = next
 
-	report := &Report{Policy: policy, Incomplete: unrenderable, Head: pr.HeadSHA, PullRequest: pr}
+	report := &Report{Policy: policy, Incomplete: unrenderable, Head: pr.HeadSHA, PullRequest: pr, FastReview: e.FastReview, FastLimit: e.FastLimit}
 	defer func() { report.Routes = e.routeDecisions }()
+	defer func() { report.Elapsed = time.Since(started) }()
 
 	// What an earlier run left on the pull request, read after the policy is
 	// settled because review.incremental is policy. A provider that cannot answer
 	// (the local one, every test double that does not opt in) leaves prior nil
 	// and the whole change is reviewed, which is also what happens on a first
 	// run.
+	priorStart := time.Now()
 	prior := e.priorReview(ctx, ref)
+	e.log().Info("earlier review read", "elapsed", time.Since(priorStart).Round(time.Millisecond))
+	if e.Resume && e.priorReadErr != nil {
+		report.priorReadFailed = true
+	}
+	e.startProgress(pr, prior)
+	// Residual approve still needs the prior when incremental is off: without
+	// it, withholdAlreadyReported cannot see recurrences and standing threads
+	// are invisible until after the judge has already run.
+	if prior == nil && e.Config.Review.Approve.Enabled && e.Config.Review.Approve.Residual.Enabled {
+		if e.Resume || (e.Config.Review.Incremental && !e.Full) {
+			// priorReview already attempted the read; reuse its failure.
+			if e.priorReadErr != nil {
+				report.priorReadFailed = true
+			}
+		} else {
+			loaded, err := e.readPriorReviewResult(ctx, ref)
+			if err != nil {
+				e.log().Warn("could not read earlier reviews for residual approve", "error", err)
+				report.priorReadFailed = true
+			} else {
+				prior = loaded
+			}
+		}
+	}
+	report.prior = prior
 	if prior != nil {
 		report.PriorComments = len(prior.Comments)
 	}
-	files, report.Incremental = e.narrowToChangedSince(ctx, ref, pr, files, prior)
+	// Resume keeps the full plan for downstream checks; model requests reuse
+	// matching results later. A residual-only prior read must not shrink it.
+	narrowPrior := prior
+	if e.FastReview || (!e.Resume && (!e.Config.Review.Incremental || e.Full)) {
+		narrowPrior = nil
+	}
+	narrowStart := time.Now()
+	files, report.Incremental = e.narrowToChangedSince(ctx, ref, pr, files, narrowPrior)
+	e.log().Info("narrowed to changes since the last review", "elapsed", time.Since(narrowStart).Round(time.Millisecond))
+	// Cleared per run: Review may be called more than once on one Engine, and a
+	// stale map would exempt files from the progress cache after the comments
+	// that justified it were closed.
+	e.standingOnly = nil
+	if report.Incremental != nil {
+		e.standingOnly = report.Incremental.StandingOnly
+	}
+	if e.FastLimit > 0 {
+		files = rankFiles(files)
+	}
 	report.Files = files
 
 	fetch := func(ctx context.Context, path string) ([]byte, error) {
@@ -698,11 +879,21 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// before the plan and does not depend on it, so what it costs is known
 	// here. A budget that bounded only the entries let a request estimated at
 	// 24,852 tokens reach the provider at 32,653.
-	plan, err := bundle.AssembleReserving(ctx, e.Config, files, fetch,
-		bundle.ListerFrom(e.Provider, ref), bundle.Reserve{Tokens: e.framingTokens(pr)})
-	if err != nil {
-		return nil, fmt.Errorf("assemble review: %w", err)
+	var plan *bundle.Plan
+	if e.Config.Practices.Profile == "engineering" {
+		designStart := time.Now()
+		execution := e.assembleDesign(ctx, ref, files, bundle.Reserve{Tokens: e.framingTokens(pr)})
+		e.log().Info("design assembled", "elapsed", time.Since(designStart).Round(time.Millisecond))
+		report.DesignExecution = &execution
+		plan = execution.Plan
+	} else {
+		plan, err = bundle.AssembleReserving(ctx, e.Config, files, fetch,
+			bundle.ListerFrom(e.Provider, ref), bundle.Reserve{Tokens: e.framingTokens(pr)})
+		if err != nil {
+			return nil, fmt.Errorf("assemble review: %w", err)
+		}
 	}
+	report.Flow = e.flowDiagram(ctx, ref, files, report.DesignExecution)
 	if plan.RelatedDefinitions > 0 {
 		e.log().Info("attached related context", "definitions", plan.RelatedDefinitions, "files", len(plan.RelatedFiles))
 	}
@@ -710,7 +901,13 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		e.log().Debug("skipped file", "path", s.Path, "reason", s.Reason)
 	}
 
-	if fit, trimmed, err := e.applyBudget(ctx, ref, prior, plan, files, fetch); err != nil {
+	// prior, not narrowPrior: pull-request budget scope needs prior spend even
+	// when residual loaded the prior without enabling incremental narrowing.
+	if report.DesignExecution != nil {
+		budgetStart := time.Now()
+		report.Budget = e.applyDesignBudget(ctx, ref, prior, &report.DesignExecution.DesignPacking, files)
+		e.log().Info("design budget applied", "elapsed", time.Since(budgetStart).Round(time.Millisecond))
+	} else if fit, trimmed, err := e.applyBudget(ctx, ref, prior, plan, files, fetch); err != nil {
 		return nil, err
 	} else if fit != nil {
 		report.Budget = fit
@@ -756,12 +953,18 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	}
 
 	findings, unreviewed, escalated, err := e.analyze(ctx, pr, plan, sem)
+	report.AssessedDesignTasks = append([]string(nil), e.assessedDesignTasks...)
 	styleWG.Wait()
+	report.Incomplete = append(report.Incomplete, unreviewed...)
+	slices.Sort(report.Incomplete)
+	report.Incomplete = slices.Compact(report.Incomplete)
+	report.Escalated = append(report.Escalated, escalated...)
 	if err != nil {
+		if report.DesignExecution != nil {
+			return e.incompleteDesignReview(ctx, ref, report, findings, "review", err)
+		}
 		return nil, err
 	}
-	report.Incomplete = append(report.Incomplete, unreviewed...)
-	report.Escalated = append(report.Escalated, escalated...)
 
 	if styleErr != nil {
 		e.log().Warn("style pass failed; the review is complete for defects "+
@@ -809,7 +1012,8 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		findings = append(findings, lint...)
 	}
 
-	findings, dropped := e.filterAnchors(findings, files)
+	findings, dropped, unpublished := e.filterTaskAnchors(findings, files)
+	report.UnpublishedModelFindings = append(report.UnpublishedModelFindings, unpublished...)
 	discarded = append(discarded, dropped...)
 
 	// A known advisory is deterministic evidence: a scanner matched a pinned
@@ -822,7 +1026,16 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// class and their line, and still pass the operator's ceiling and gate.
 	findings, advisories := holdAdvisories(dedupe(findings))
 
-	summary, findings, withheldByTriage, err := e.triage(ctx, pr, findings)
+	beforeTriage := findings
+	var summary string
+	var withheldByTriage []Overruled
+	if e.SkipTriage {
+		// Findings are already locally deduplicated below. A fast pass spends
+		// its request budget on changed files, and says it omitted model triage.
+		findings = dedupe(findings)
+	} else {
+		summary, findings, withheldByTriage, err = e.triage(ctx, pr, findings)
+	}
 	switch {
 	case errors.Is(err, errStageDegraded):
 		// Usable output behind a failed stage. The findings publish and the
@@ -830,6 +1043,9 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		// downstream from reading this as a clean review.
 		report.Stages = append(report.Stages, StageStatus{Stage: "triage", Reason: errorKind(err)})
 	case err != nil:
+		if report.DesignExecution != nil {
+			return e.incompleteDesignReview(ctx, ref, report, beforeTriage, "triage", err)
+		}
 		return nil, err
 	}
 	// The summary was written over what triage saw, which the advisories
@@ -847,7 +1063,11 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// validated again afterwards. Without this a triage model can move a comment
 	// onto a line that is not in the diff, which the forge rejects, taking every
 	// inline comment in the review down with it.
-	findings, dropped = e.filterAnchors(findings, files)
+	findings, dropped, unpublished = e.filterTaskAnchors(findings, files)
+	report.UnpublishedModelFindings = append(report.UnpublishedModelFindings, unpublished...)
+	if len(report.UnpublishedModelFindings) > 0 {
+		report.Stages = append(report.Stages, StageStatus{Stage: "design evidence", Reason: "model findings cited source outside their task"})
+	}
 	discarded = append(discarded, dropped...)
 
 	// Assembled here rather than where the analyzer set was read, BECAUSE READING
@@ -883,13 +1103,27 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 	// After the gate, so what is counted as "already posted" is what would
 	// otherwise have been posted, and nothing below min_severity is.
 	findings, report.AlreadyReported = withholdAlreadyReported(findings, prior)
+	// A finding a person answered and the reviewer accepted is not posted
+	// again. Kept apart from AlreadyReported, which holds recurrences that are
+	// still standing on the pull request and so block an approval: a dismissed
+	// finding has no thread left to stand.
+	findings, report.Dismissed = dropDismissed(findings, e.dismissals(ctx, ref, prior))
+	// The bound applies to what this run would publish, so a finding an earlier
+	// run already posted must not consume one of the bounded slots. Applied the
+	// other way around, an incremental re-review of a file whose findings did
+	// not change fills FastLimit with withheld recurrences and reports the fresh
+	// findings below them as omitted.
+	if e.FastLimit > 0 && len(findings) > e.FastLimit {
+		report.OmittedFindings = len(findings) - e.FastLimit
+		findings = findings[:e.FastLimit]
+	}
 	if report.reusableCoverage() {
-		report.Superseded = e.superseded(ctx, ref, prior, report.Incremental, findings, report.AlreadyReported, plan.Skipped)
+		report.Superseded = e.superseded(ctx, ref, prior, report.Incremental, findings, report.AlreadyReported, report.unreadFileSkips())
 		// A clean completed run under review.approve must not leave its own
 		// earlier threads open: reviewEvent refuses APPROVE while any stand,
 		// and a reader who sees COMMENT beside "0 findings" has no reason to
 		// trust the next push will close them either.
-		if more := e.resolveClearedForApprove(ctx, ref, prior, report, findings, plan.Skipped); len(more) > 0 {
+		if more := e.resolveClearedForApprove(ctx, ref, prior, report, findings, report.unreadFileSkips()); len(more) > 0 {
 			report.Superseded = append(report.Superseded, more...)
 		}
 	}
@@ -922,6 +1156,31 @@ func (e *Engine) Review(ctx context.Context, ref vcs.Ref) (*Report, error) {
 		return report, err
 	}
 	return report, nil
+}
+
+// rankFiles puts the changed files a bounded review will read first. The
+// planner preserves its input order when review.max_files binds, so ranking
+// here makes the ceiling select risk rather than lexical diff order.
+func rankFiles(files diff.Files) diff.Files {
+	type rankedFile struct {
+		file  *diff.File
+		score Complexity
+	}
+	ranked := make([]rankedFile, 0, len(files))
+	for _, f := range files {
+		ranked = append(ranked, rankedFile{file: f, score: Score(f)})
+	}
+	slices.SortStableFunc(ranked, func(a, b rankedFile) int {
+		if byScore := cmp.Compare(b.score.Score, a.score.Score); byScore != 0 {
+			return byScore
+		}
+		return cmp.Compare(a.score.Path, b.score.Path)
+	})
+	out := make(diff.Files, 0, len(files))
+	for _, f := range ranked {
+		out = append(out, f.file)
+	}
+	return out
 }
 
 // ErrPublish marks a review that completed and could not be delivered. The
@@ -986,14 +1245,44 @@ func validateSuggestions(findings []Finding, files diff.Files) []Finding {
 // what every run did before this existed, while the cost of guessing would be
 // a review that skipped files on the strength of a request that failed.
 func (e *Engine) priorReview(ctx context.Context, ref vcs.Ref) *vcs.PriorReview {
-	if e.Full || !e.Config.Review.Incremental {
+	if !e.Resume && (e.Full || !e.Config.Review.Incremental) {
 		return nil
 	}
-	reader, ok := e.Provider.(vcs.PriorReviewer)
-	if !ok {
-		return nil
+	return e.readPriorReview(ctx, ref)
+}
+
+// priorForResidualResolve returns the earlier review for residual thread
+// resolve. Reuses report.prior (filled by Review from incremental or the
+// residual early load); otherwise reads once.
+//
+// ok is false when the provider can answer PriorReview but the read failed,
+// or when the early residual load already failed: residual must hold COMMENT
+// rather than treat the failure as "no comments".
+func (e *Engine) priorForResidualResolve(ctx context.Context, ref vcs.Ref, report *Report) (prior *vcs.PriorReview, ok bool) {
+	if report != nil && report.priorReadFailed {
+		return nil, false
 	}
-	prior, err := reader.PriorReview(ctx, ref)
+	if report != nil && report.prior != nil {
+		return report.prior, true
+	}
+	prior, err := e.readPriorReviewResult(ctx, ref)
+	if err != nil {
+		e.log().Warn("could not read earlier reviews for residual resolve", "error", err)
+		return nil, false
+	}
+	if report != nil {
+		report.prior = prior
+		// Incremental off never set PriorComments; residual still needs the
+		// count so standing threads refuse APPROVE after a judge yes.
+		if prior != nil && report.PriorComments == 0 {
+			report.PriorComments = len(prior.Comments)
+		}
+	}
+	return prior, true
+}
+
+func (e *Engine) readPriorReview(ctx context.Context, ref vcs.Ref) *vcs.PriorReview {
+	prior, err := e.readPriorReviewResult(ctx, ref)
 	if err != nil {
 		e.log().Warn("could not read earlier reviews; reviewing the whole change", "error", err)
 		return nil
@@ -1001,69 +1290,138 @@ func (e *Engine) priorReview(ctx context.Context, ref vcs.Ref) *vcs.PriorReview 
 	return prior
 }
 
-// narrowToChangedSince restricts a diff to the files that moved since the last
-// run this tool made on the pull request.
+func (e *Engine) readPriorReviewResult(ctx context.Context, ref vcs.Ref) (*vcs.PriorReview, error) {
+	reader, ok := e.Provider.(vcs.PriorReviewer)
+	if !ok {
+		e.priorReadErr = nil
+		return nil, nil
+	}
+	prior, err := reader.PriorReview(ctx, ref)
+	e.priorReadErr = err
+	if err != nil {
+		return nil, err
+	}
+	return prior, nil
+}
+
+// narrowToChangedSince re-reads the files that changed since the prior head,
+// widened to include every file still carrying a standing comment: without
+// that, superseded and resolveClearedForApprove cannot verify or close a
+// thread on a file this run never looked at.
 //
-// It returns the files unchanged, and no note, whenever the question cannot be
-// answered: no earlier run, an earlier run that did not record its head, the
-// same head as before, a provider that cannot compare, or a force push that
-// made the earlier head unreachable. Every one of those is a full review, and
-// the note is what tells the reader the difference.
+// Full scope remains the answer whenever narrowing itself is unavailable: no
+// earlier head, the same head reviewed again under Resume (a retry needs
+// every file walked so a failed batch can be retried and a successful one
+// reused, since nothing has changed to narrow against yet), no provider that
+// can answer ChangedSince, or a revision comparison can no longer reach (a
+// force push). A same-head re-run outside Resume with no standing comments
+// reads nothing: the earlier review already covered this exact revision.
+// Beyond the cases above, request-level Resume does not force full scope:
+// Resume reuses completed model requests inside a batch, but narrowing
+// decides which files are bundled into a batch in the first place, and a
+// push that touches one file on a large pull request should not re-bundle,
+// re-lint, and re-send every other file to get that reuse.
 func (e *Engine) narrowToChangedSince(ctx context.Context, ref vcs.Ref, pr *vcs.PullRequest, files diff.Files, prior *vcs.PriorReview) (diff.Files, *Incremental) {
 	if prior == nil || pr == nil {
 		return files, nil
 	}
-	// Standing findings force a full re-read even when the earlier run left no
-	// head to compare against: without that, superseded cannot close them and
-	// an approval would be held forever beside threads nothing re-checked.
-	if len(prior.Comments) > 0 {
-		return files, &Incremental{Since: prior.Head, Reviewed: files.Paths(), Recheck: true}
+	standing := len(prior.Comments) > 0
+	// A standing comment can name a file this push no longer carries, so the
+	// set is filtered to the diff: StandingOnly is a subset of Reviewed, and
+	// an absent file was never read.
+	present := map[string]bool{}
+	for _, f := range files {
+		present[f.Path] = true
+	}
+	standingPaths := map[string]bool{}
+	for _, c := range prior.Comments {
+		if present[c.Path] {
+			standingPaths[c.Path] = true
+		}
+	}
+	// Only a same-head run can claim its standing comment files were checked
+	// on unchanged content: every other fallback reaches this point because
+	// the earlier head could not be compared, so nothing established that a
+	// standing file's content stayed put. A checkpoint from a failed attempt
+	// at this same push carries the head even though the forge has no
+	// completion marker for it, which is the retry case Resume exists for.
+	sameHead := pr.HeadSHA != "" && (prior.Head == pr.HeadSHA || e.progress.savedHead() == pr.HeadSHA)
+	fullRecheck := func() (diff.Files, *Incremental) {
+		if !standing {
+			return files, nil
+		}
+		note := &Incremental{Since: prior.Head, Reviewed: files.Paths(), Recheck: true, StandingOnly: map[string]bool{}}
+		if sameHead {
+			note.StandingOnly = standingPaths
+		}
+		return files, note
 	}
 	if prior.Head == "" {
-		return files, nil
+		return fullRecheck()
 	}
 	if prior.Head == pr.HeadSHA {
-		// The same commit reviewed again (a reopen, or a re-run). Nothing
-		// moved, so nothing is re-read: the run stops at the empty batch
-		// with this note as its only output, and the earlier review stands.
+		if standing {
+			return fullRecheck()
+		}
+		if e.Resume {
+			// A retry of the same push: nothing changed to narrow against, so
+			// every file is walked again. Downstream checks only see this
+			// returned set, so a narrowing here would silently skip linters
+			// and the like for files a failed batch never read.
+			return files, nil
+		}
+		// The same commit reviewed again outside Resume (a reopen, or a
+		// re-run). Nothing moved, so nothing is re-read: the run stops at
+		// the empty batch with this note as its only output, and the
+		// earlier review stands.
 		return nil, &Incremental{Since: prior.Head, Unchanged: files.Paths()}
 	}
+
+	// A new push. Narrowed regardless of Resume: Resume's cache handles
+	// request-level reuse inside whatever batches this assembles, which is
+	// smaller work the narrower this scope is.
 	differ, ok := e.Provider.(vcs.IncrementalDiffer)
 	if !ok {
-		return files, nil
+		return fullRecheck()
 	}
 
 	changed, ok, err := differ.ChangedSince(ctx, ref, prior.Head)
 	if err != nil {
 		e.log().Warn("could not compare against the earlier review; reviewing the whole change",
 			"since", prior.Head, "error", err)
-		return files, nil
+		return fullRecheck()
 	}
 	if !ok {
 		e.log().Info("earlier reviewed revision is not an ancestor of this one; reviewing the whole change",
 			"since", prior.Head)
-		return files, nil
+		return fullRecheck()
 	}
 
 	moved := make(map[string]bool, len(changed))
 	for _, p := range changed {
 		moved[p] = true
 	}
-
-	note := &Incremental{Since: prior.Head}
+	note := &Incremental{Since: prior.Head, Recheck: standing, StandingOnly: map[string]bool{}}
 	var kept diff.Files
 	for _, f := range files {
 		// A rename since the last review shows up under either name.
-		if moved[f.Path] || (f.OldPath != "" && moved[f.OldPath]) {
+		changedHere := moved[f.Path] || (f.OldPath != "" && moved[f.OldPath])
+		if changedHere || standingPaths[f.Path] {
 			kept = append(kept, f)
 			note.Reviewed = append(note.Reviewed, f.Path)
+			if !changedHere && standingPaths[f.Path] {
+				// In scope only because a comment is standing on it, not
+				// because this push touched it: the progress cache must not
+				// answer for this file (see StandingOnly's doc comment).
+				note.StandingOnly[f.Path] = true
+			}
 			continue
 		}
 		note.Unchanged = append(note.Unchanged, f.Path)
 	}
 
 	e.log().Info("incremental review", "since", prior.Head,
-		"files", len(kept), "unchanged", len(note.Unchanged))
+		"files", len(kept), "unchanged", len(note.Unchanged), "standing", standing)
 	return kept, note
 }
 
@@ -1142,10 +1500,20 @@ func (e *Engine) superseded(ctx context.Context, ref vcs.Ref, prior *vcs.PriorRe
 // whose line the forge no longer places). Without it, PriorComments stays
 // above Superseded and reviewEvent publishes COMMENT forever.
 func (e *Engine) resolveClearedForApprove(ctx context.Context, ref vcs.Ref, prior *vcs.PriorReview, report *Report, findings []Finding, skipped []bundle.Skip) []vcs.PriorComment {
-	if e.Config == nil || !e.Config.Review.Approve.Enabled || prior == nil || report == nil {
+	if e.Config == nil || !e.Config.Review.Approve.Enabled || prior == nil || report == nil || report.FastReview {
 		return nil
 	}
-	if len(findings) > 0 || len(report.AlreadyReported) > 0 || !report.Complete() {
+	residual := report.ResidualApprove
+	if len(report.AlreadyReported) > 0 || !report.Complete() || !report.PipelineComplete() {
+		return nil
+	}
+	if residual {
+		// ResidualApprove is set only after the floor gate, but resolve must
+		// not close threads if that invariant ever fails.
+		if !residualWithinFloor(findings, residualMaxSeverity(e.Config)) {
+			return nil
+		}
+	} else if len(findings) > 0 {
 		return nil
 	}
 	resolver, ok := e.Provider.(vcs.ThreadResolver)
@@ -1160,21 +1528,22 @@ func (e *Engine) resolveClearedForApprove(ctx context.Context, ref vcs.Ref, prio
 	for _, skip := range skipped {
 		excluded[skip.Path] = true
 	}
-	reread := map[string]bool{}
-	if report.Incremental != nil {
-		for _, p := range report.Incremental.Reviewed {
-			reread[p] = true
-		}
-	}
+	reread := residualReread(report)
 	var candidates []vcs.PriorComment
 	var ids []int64
 	for _, c := range prior.Comments {
 		if c.ID == 0 || done[c.ID] || excluded[c.Path] {
 			continue
 		}
-		// Same eligibility as superseded: only close what this run re-read, or
-		// a comment the forge no longer places on the diff.
-		if c.Line != 0 && !reread[c.Path] {
+		// Clean approve may close a comment the forge no longer places, even
+		// off the reread set: nothing remains to re-check. Residual must not:
+		// that would clear a prior warning the judge never saw on a file this
+		// run did not read.
+		if residual {
+			if !reread[c.Path] {
+				continue
+			}
+		} else if c.Line != 0 && !reread[c.Path] {
 			continue
 		}
 		candidates = append(candidates, c)
@@ -1184,6 +1553,9 @@ func (e *Engine) resolveClearedForApprove(ctx context.Context, ref vcs.Ref, prio
 		return nil
 	}
 	reply := "Resolved by open-nitpick: the change was reviewed again and no findings remain."
+	if residual {
+		reply = "Resolved by open-nitpick: the change was reviewed again; remaining findings are within the residual approve floor."
+	}
 	resolved, err := resolver.ResolveThreads(ctx, ref, ids, reply)
 	if err != nil {
 		e.log().Warn("could not resolve comments before approval", "error", err, "resolved", len(resolved), "of", len(ids))
@@ -1204,11 +1576,101 @@ func (e *Engine) resolveClearedForApprove(ctx context.Context, ref vcs.Ref, prio
 	return out
 }
 
+// residualReread is the set of paths this run reviewed, for residual
+// thread close and for what the judge is shown as standing leftovers.
+func residualReread(report *Report) map[string]bool {
+	reread := map[string]bool{}
+	if report == nil {
+		return reread
+	}
+	if report.Incremental != nil {
+		for _, p := range report.Incremental.Reviewed {
+			reread[p] = true
+		}
+		return reread
+	}
+	for _, p := range report.Files.Paths() {
+		reread[p] = true
+	}
+	return reread
+}
+
+// residualStandingForJudge lists earlier comments residual would close after a
+// yes: on a path this run re-read, not plan-skipped, and not already superseded.
+// The set must match resolveClearedForApprove's residual candidates so the
+// judge is not shown threads publish will leave open.
+func residualStandingForJudge(report *Report) []vcs.PriorComment {
+	if report == nil || report.prior == nil {
+		return nil
+	}
+	reread := residualReread(report)
+	done := map[int64]bool{}
+	for _, c := range report.Superseded {
+		done[c.ID] = true
+	}
+	excluded := map[string]bool{}
+	if report.Plan != nil {
+		for _, skip := range report.Plan.Skipped {
+			excluded[skip.Path] = true
+		}
+	}
+	var out []vcs.PriorComment
+	for _, c := range report.prior.Comments {
+		if c.ID == 0 || done[c.ID] || excluded[c.Path] || !reread[c.Path] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 func short(sha string) string {
 	if len(sha) > 12 {
 		return sha[:12]
 	}
 	return sha
+}
+
+// dropDismissed removes the findings whose thread was closed by an accepted
+// reply, returning what is left and what was removed.
+func dropDismissed(findings []Finding, answered []string) (publish, dismissed []Finding) {
+	if len(answered) == 0 {
+		return findings, nil
+	}
+	closed := make(map[string]bool, len(answered))
+	for _, fp := range answered {
+		closed[fp] = true
+	}
+	for _, f := range findings {
+		if closed[Fingerprint(f)] {
+			dismissed = append(dismissed, f)
+			continue
+		}
+		publish = append(publish, f)
+	}
+	return publish, dismissed
+}
+
+// dismissals names the findings a person's reply already settled.
+//
+// Read apart from the incremental prior because a full review, which is what
+// restart-review asks for, does not load one, and that is the run most likely
+// to produce the same finding again. A read that fails leaves the finding
+// postable: the cost is one repeated comment, which the person can answer
+// again.
+func (e *Engine) dismissals(ctx context.Context, ref vcs.Ref, prior *vcs.PriorReview) []string {
+	if prior != nil {
+		return prior.Dismissed
+	}
+	reader, ok := e.Provider.(vcs.PriorReviewer)
+	if !ok {
+		return nil
+	}
+	read, err := reader.PriorReview(ctx, ref)
+	if err != nil || read == nil {
+		return nil
+	}
+	return read.Dismissed
 }
 
 func withholdAlreadyReported(findings []Finding, prior *vcs.PriorReview) (publish, withheld []Finding) {
@@ -1229,6 +1691,7 @@ func withholdAlreadyReported(findings []Finding, prior *vcs.PriorReview) (publis
 //
 // Partial results are published with failed batches recorded as incomplete.
 func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.Plan, sem chan struct{}) ([]Finding, []string, []Escalation, error) {
+	e.assessedDesignTasks = nil
 	// Built once for the default reviewer so a prompt error surfaces before
 	// any batch runs; routed reviewers build theirs on first use.
 	if _, err := e.reviewPromptFor(e.Roles.Review); err != nil {
@@ -1248,8 +1711,9 @@ func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.
 
 		// unreviewed collects the files whose batch never produced a result,
 		// so the report can say so instead of implying they were clean.
-		unreviewed []string
-		decisions  []RouteDecision
+		unreviewed          []string
+		decisions           []RouteDecision
+		assessedDesignTasks []string
 
 		wg sync.WaitGroup
 	)
@@ -1303,6 +1767,9 @@ func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.
 				unreviewed = append(unreviewed, b.Paths()...)
 				return
 			}
+			if b.DesignTask != "" {
+				assessedDesignTasks = append(assessedDesignTasks, b.DesignTaskIDs()...)
+			}
 			findings = append(findings, result...)
 			e.log().Info("batch done", "batch", i+1, "of", total, "done", done.Add(1), "findings", len(result), "elapsed", time.Since(started).Round(time.Second))
 		}(i, b)
@@ -1314,14 +1781,16 @@ func (e *Engine) analyze(ctx context.Context, pr *vcs.PullRequest, plan *bundle.
 		return strings.Join(decisions[i].Files, ",") < strings.Join(decisions[j].Files, ",")
 	})
 	e.routeDecisions = decisions
+	sort.Strings(assessedDesignTasks)
+	e.assessedDesignTasks = assessedDesignTasks
 
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return findings, unreviewed, escalated, err
 	}
 	// Every batch failing means something systemic (bad credentials, a wrong
 	// model name), and reporting "no issues found" would be a lie.
 	if failures > 0 && failures == len(plan.Batches) {
-		return nil, nil, nil, fmt.Errorf("all %d review batches failed; see log for details", failures)
+		return findings, unreviewed, escalated, fmt.Errorf("all %d review batches failed; see log for details", failures)
 	}
 	if failures > 0 {
 		e.log().Warn("review is incomplete",
@@ -1420,7 +1889,6 @@ func (e *Engine) analyzeStyle(ctx context.Context, pr *vcs.PullRequest, plan *bu
 	return out, nil
 }
 
-// analyzeBatch reviews one batch.
 // analyzeBatch reviews a batch with the default review client.
 func (e *Engine) analyzeBatch(ctx context.Context, base, prContext string, b bundle.Batch, style bool) ([]Finding, error) {
 	return e.analyzeBatchWith(ctx, e.Roles.Review, base, prContext, b, style)
@@ -1436,10 +1904,7 @@ func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base,
 		body.WriteString("\n")
 	}
 	body.WriteString("Review the following changes.\n\n")
-	for _, entry := range b.Entries {
-		body.WriteString(bundle.Render(entry))
-		body.WriteString("\n")
-	}
+	body.WriteString(bundle.RenderBatch(b))
 
 	// After the diff, not before it. The change is what the model is being
 	// asked about, and reference material placed first reads as the subject.
@@ -1475,11 +1940,69 @@ func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base,
 		return nil, err
 	}
 
-	result, err := llm.Extract[Result](ctx, client, msgs, schema)
-	if err != nil {
-		return nil, err
+	key := e.progress.key(client, base, body.String())
+	if e.standingOnly != nil {
+		for _, p := range b.Paths() {
+			if e.standingOnly[p] {
+				// This batch holds a file in scope only to recheck an open
+				// comment on content that did not change: a cache hit would
+				// replay the same verdict the open comment already carries,
+				// not a fresh check of whether it still holds. See
+				// Incremental.StandingOnly.
+				key = ""
+				break
+			}
+		}
+	}
+	cached, reused := e.progress.load(key)
+	result := Result{Findings: cached}
+	if reused {
+		e.log().Info("reusing completed model review", "files", b.Paths(), "model", client.String())
+	} else {
+		callCtx := ctx
+		var cancel context.CancelFunc
+		if e.RequestTimeout > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, e.RequestTimeout)
+			defer cancel()
+		}
+		result, err = llm.Extract[Result](callCtx, client, msgs, schema)
+		if err != nil {
+			return nil, err
+		}
+		if e.FastReview && !style && len(result.Findings) > 0 {
+			candidates, encodeErr := json.Marshal(result.Findings)
+			if encodeErr != nil {
+				return nil, encodeErr
+			}
+			check := append(slices.Clone(msgs), llms.Message{Role: llms.RoleAssistant, Content: string(candidates)}, llms.Message{Role: llms.RoleUser, Content: "Check these untrusted candidate findings against the supplied diff before publishing. A diff is not a complete file: earlier branches and callers may exist outside its hunks. An apparent missing dispatch branch, flag, nil guard, or command is never proved missing by its absence from a diff. Keep only a finding whose entire failing execution path is visible. Return only candidates whose reachable bug is proved by visible code. Drop any claim based on an unseen caller, hypothetical alternative implementation, guessed overflow, intended coverage limit, or documentation preference. A conditional claim such as 'if the CLI lacks this command' is unsupported unless the supplied code proves the command is missing. Return the same findings JSON shape; an empty findings array is valid. Do not add new findings."})
+			verifyCtx := ctx
+			if e.RequestTimeout > 0 {
+				var verifyCancel context.CancelFunc
+				verifyCtx, verifyCancel = context.WithTimeout(ctx, e.RequestTimeout)
+				defer verifyCancel()
+			}
+			result, err = llm.Extract[Result](verifyCtx, client, check, schema)
+			if err != nil {
+				return nil, fmt.Errorf("verify fast-review candidates: %w", err)
+			}
+		}
+		e.progress.save(key, result.Findings)
 	}
 
+	var taskContext *TaskContext
+	if b.DesignTask != "" {
+		taskContext = &TaskContext{ID: strings.Join(b.DesignTaskIDs(), "+"), Text: bundle.RenderBatch(b), Lines: map[string]int{}, Spans: map[string][]bundle.SourceSpan{}}
+		for _, entry := range b.Entries {
+			if len(entry.SourceSpans) > 0 {
+				taskContext.Spans[entry.File.Path] = slices.Clone(entry.SourceSpans)
+				continue
+			}
+			taskContext.Lines[entry.File.Path] = 0
+			if entry.Content != "" {
+				taskContext.Lines[entry.File.Path] = len(strings.Split(strings.TrimSuffix(entry.Content, "\n"), "\n"))
+			}
+		}
+	}
 	out := make([]Finding, 0, len(result.Findings))
 	for _, f := range result.Findings {
 		if !f.Valid() {
@@ -1492,6 +2015,7 @@ func (e *Engine) analyzeBatchWith(ctx context.Context, client *llm.Client, base,
 		f.Source = client.String()
 		// What the reviewer read, not what persuaded it. See evidence.go.
 		f.Evidence = evidenceFor(f, hits)
+		f.TaskContext = taskContext
 		out = append(out, f)
 	}
 	return out, nil
@@ -1606,6 +2130,19 @@ func (e *Engine) filterAnchors(findings []Finding, files diff.Files) ([]Finding,
 		})
 	}
 
+	// One anchor set per file, built on first need. This loop is sequential, so
+	// a plain map is safe; memoising on diff.File would race with the batch
+	// goroutines that read diff.Files.
+	anchorSets := map[*diff.File][]int{}
+	anchorsOf := func(file *diff.File) []int {
+		set, ok := anchorSets[file]
+		if !ok {
+			set = file.CommentableLines()
+			anchorSets[file] = set
+		}
+		return set
+	}
+
 	for _, f := range findings {
 		file := files.Find(f.Path)
 		if file == nil {
@@ -1619,7 +2156,7 @@ func (e *Engine) filterAnchors(findings []Finding, files diff.Files) ([]Finding,
 			continue
 		}
 
-		snapped, ok := file.NearestCommentableLine(f.Line, snapDistance)
+		snapped, ok := diff.NearestLine(anchorsOf(file), f.Line, snapDistance)
 		if !ok {
 			e.log().Debug("dropped finding outside the diff",
 				"path", f.Path, "line", f.Line, "title", f.Title)
@@ -1777,10 +2314,12 @@ func (e *Engine) triage(ctx context.Context, pr *vcs.PullRequest, findings []Fin
 		delete(mergedInto, number)
 	}
 
+	acknowledgements := acknowledgementDecisions(findings, result, judged)
+
 	// The merges first, in their own pass. A survivor absorbs what was merged
 	// into it before anything publishes: folded in afterwards, the survivor has
 	// already been copied and the union lands on a value nobody reads.
-	var merged []Overruled
+	var withheld []Overruled
 	for i := range findings {
 		d, ok := mergedInto[i+1]
 		if !ok {
@@ -1790,7 +2329,7 @@ func (e *Engine) triage(ctx context.Context, pr *vcs.PullRequest, findings []Fin
 		// true sentence about a defect two reviewers reported names both of
 		// them, and picking one destroys half of it.
 		absorb(&findings[d.DuplicateOf-1], findings[i])
-		merged = append(merged, Overruled{
+		withheld = append(withheld, Overruled{
 			Finding: findings[i],
 			Expert:  "triage (" + e.Roles.Triage.String() + ")",
 			Reason: fmt.Sprintf("merged into the finding at %s:%d: %s",
@@ -1806,6 +2345,14 @@ func (e *Engine) triage(ctx context.Context, pr *vcs.PullRequest, findings []Fin
 		}
 
 		f := findings[i]
+		if a, ok := acknowledgements[number]; ok {
+			withheld = append(withheld, Overruled{
+				Finding: f,
+				Expert:  "triage (" + e.Roles.Triage.String() + ")",
+				Reason:  fmt.Sprintf("assessment acknowledgement: %s; original rationale: %q", strings.TrimSpace(a.Reason), a.Quote),
+			})
+			continue
+		}
 		if v, ok := judged[number]; ok {
 			e.applyVerdict(&f, v)
 		} else {
@@ -1819,7 +2366,6 @@ func (e *Engine) triage(ctx context.Context, pr *vcs.PullRequest, findings []Fin
 		f.Triager = e.Roles.Triage.String()
 		kept = append(kept, f)
 	}
-	withheld := merged
 
 	return strings.TrimSpace(result.Summary), kept, withheld, nil
 }
@@ -1938,6 +2484,9 @@ func (e *Engine) validateFindings(ctx context.Context, findings []Finding, plan 
 		Corpus: e.knowledgeCorpus(),
 	}
 
+	if e.Config.Practices.Profile == "engineering" {
+		v.PromptTokenLimit = e.Config.Review.TokenBudgetPerRequest
+	}
 	kept, overruled, failures := v.validateWithCoverage(ctx, findings, renderedFiles(plan))
 	if len(overruled) > 0 {
 		e.log().Info("experts overruled findings",
@@ -2022,11 +2571,41 @@ func renderedFiles(plan *bundle.Plan) map[string]string {
 // publish renders and delivers the review.
 func (e *Engine) publish(ctx context.Context, ref vcs.Ref, report *Report, files diff.Files) error {
 	report.Routes = e.routeDecisions
+	report.Progress, report.ReusedRequests = e.progress.snapshot(report.Head)
 	if e.ModelUsage != nil {
 		report.ModelUsage = e.ModelUsage()
 	}
 	if e.AssessPractices != nil {
 		report.Practices = e.AssessPractices(ctx, ref, report.PullRequest, report)
+	}
+	// Failures stay COMMENT: ResidualApprove is set only on a parsed yes.
+	judgeRan := residualJudgeEligible(report, e.Config)
+	e.judgeResidualApprove(ctx, report)
+	if report.ResidualApprove {
+		// priorReview hides the prior when incremental is off; residual still
+		// needs it to close standing threads after a yes.
+		prior, priorOK := e.priorForResidualResolve(ctx, ref, report)
+		if !priorOK {
+			e.log().Warn("residual approve held; could not read earlier reviews")
+			report.ResidualApprove = false
+			report.ResidualReason = ""
+		} else if prior != nil {
+			if more := e.resolveClearedForApprove(ctx, ref, prior, report, report.Findings, report.unreadFileSkips()); len(more) > 0 {
+				report.Superseded = append(report.Superseded, more...)
+			}
+		}
+		// reviewEvent still refuses APPROVE while threads stand; clear the
+		// flag so a granted log does not outlive a held event.
+		if report.ResidualApprove && standingThreadsRemain(report) {
+			e.log().Info("residual approve held; standing threads remain",
+				"prior", report.PriorComments, "superseded", len(report.Superseded))
+			report.ResidualApprove = false
+			report.ResidualReason = ""
+		}
+	}
+	// Refresh only when the judge could have added usage; the meter is cumulative.
+	if judgeRan && e.ModelUsage != nil {
+		report.ModelUsage = e.ModelUsage()
 	}
 	e.log().Info("publishing", "findings", len(report.Findings), "provider", e.Provider.Name())
 	review := Render(report, files, e.Config)
@@ -2035,7 +2614,7 @@ func (e *Engine) publish(ctx context.Context, ref vcs.Ref, report *Report, files
 	// clean run under review.approve with review.summary off renders no
 	// comments and no summary, and returning here would drop the approval and
 	// log "nothing to publish" over a review that had something to say.
-	if len(review.Comments) == 0 && review.Summary == "" && review.Event == vcs.EventComment {
+	if len(review.Comments) == 0 && review.Summary == "" && review.Event == vcs.EventComment && len(review.Progress) == 0 {
 		e.log().Info("nothing to publish")
 		return nil
 	}
@@ -2063,6 +2642,13 @@ func (e *Engine) reviewPrompt() (string, error) {
 // is shared, the model-family layer is the client's own. A nil client is
 // the configured review model, for callers that only want the text.
 func (e *Engine) reviewPromptFor(client *llm.Client) (string, error) {
+	if e.FastReview {
+		p, err := prompt.Build(prompt.NameFastReview, prompt.Options{Run: e.Instruction})
+		if err != nil {
+			return "", err
+		}
+		return p.String(), nil
+	}
 	var modelText string
 	if e.Config.Review.ModelNotesOn() {
 		model := e.Config.Models.ResolveModel(config.RoleReview).Model
@@ -2381,3 +2967,15 @@ func (n noPolicy) ResolvePolicy(context.Context, vcs.Ref, *vcs.PullRequest, []st
 
 // Reason names why this construction resolves no policy.
 func (n noPolicy) Reason() string { return n.reason }
+
+func (e *Engine) incompleteDesignReview(ctx context.Context, ref vcs.Ref, report *Report, findings []Finding, stage string, err error) (*Report, error) {
+	report.Findings, report.Counts = findings, counts(findings)
+	report.Stages = append(report.Stages, StageStatus{Stage: stage, Reason: errorKind(err)})
+	if e.ModelUsage != nil {
+		report.ModelUsage = e.ModelUsage()
+	}
+	if e.AssessPractices != nil {
+		report.Practices = e.AssessPractices(ctx, ref, report.PullRequest, report)
+	}
+	return report, err
+}

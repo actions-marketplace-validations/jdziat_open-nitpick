@@ -204,6 +204,13 @@ early, so the same weights on another host reproduce it. Shrinking
 Escalation is one step. A fallback naming its own fallback is a config error,
 so a misconfiguration cannot walk a batch through every model in the file.
 
+When no model can answer a batch of several files, the primary reviews it as
+two halves, and a half that fails the same way is halved in
+turn, down to single files. This is the last resort and not the first, because
+a model that loops is not helped by less input; it is for the batch whose
+answer simply did not fit. A single file or a design assessment that still
+fails is reported as unreviewed, as before.
+
 The run says when it happened, in the log and in the published review:
 
 ```
@@ -300,7 +307,7 @@ models:
 review:
   fail_on: none                    # default: advisory. Set to error/critical to gate CI.
   min_severity: info               # drop anything below this entirely
-  incremental: true                # on a re-run, read only what changed since the last review
+  incremental: true                # reuse successful model requests whose inputs still match
   related_context: true            # default: attach imported definitions used on changed lines (see below)
   related_context_callers: false   # default: also walk the repository for callers of what the change redefines
   related_context_preamble: ""     # default: the shipped "Context only" sentence; replace to tune how a model treats attached context
@@ -323,6 +330,7 @@ linters:
   auto_detect: true                # also run any installed catalog analyzer (see the table below)
   only_changed_lines: true
   max_severity: critical           # ceiling on findings attributed to an analyzer
+  build_tags: []                   # tags golangci-lint's own invocation and coverage matching both honor
 
   # Analyzer configuration. Every one of these must resolve OUTSIDE the
   # repository under review; a path inside it is refused. Empty is the default.
@@ -657,6 +665,7 @@ review:
   respond:
     from: [owner, member, collaborator]   # the default
     max_per_pull_request: 0               # 0 is no cap
+    replies: true                         # read replies under a finding
 ```
 
 `contributor` is **not** in the default set. It means "has a merged commit",
@@ -879,14 +888,20 @@ models:
     model: z-ai/glm-5.3-flash
   routes:
     - name: security
-      match: {kinds: [security, concurrency]}
-      review: {model: qwen/qwen3.8-27b}
+      match:
+        kinds: [security, concurrency]
+      review:
+        model: qwen/qwen3.8-27b
     - name: typescript
-      match: {languages: [typescript, javascript]}
-      review: {model: qwen/qwen3.8-27b}
+      match:
+        languages: [typescript, javascript]
+      review:
+        model: qwen/qwen3.8-27b
     - name: cross-file
-      match: {min_files: 2}
-      review: {model: z-ai/glm-5.3-flash}
+      match:
+        min_files: 2
+      review:
+        model: z-ai/glm-5.3-flash
 ```
 
 A match takes `languages` (the batch matches when any file is in one of them),
@@ -1081,9 +1096,12 @@ review:
   approve:
     enabled: true
     require_analyzers: false   # the default
+    residual:
+      enabled: false           # the default
+      max_severity: info       # nit, info, or warning
 ```
 
-Two conditions always hold, whatever else is configured:
+Two conditions always hold for a clean approval, whatever else is configured:
 
 - **No findings were published.** A finding filtered out by
   `review.min_severity` or the nitpick level is not a finding for this
@@ -1106,6 +1124,21 @@ wants the deterministic half counted says so. With it on, an analyzer that was
 skipped or failed holds the review at a comment, and so does a file
 `golangci-lint` read without checking, such as one a build constraint excluded
 or one the change suppressed.
+
+### Residual findings
+
+`review.approve.residual.enabled` (default off) is a second path under the
+same hard gates. When the clean path does not apply because published findings
+remain, but every published finding is at most
+`review.approve.residual.max_severity` (default `info`; allowed: `nit`,
+`info`, `warning`), the triage model judges whether those residuals are still
+non-blocking at the configured `persona.nitpick` level. A yes becomes APPROVE;
+a no, a model error, or any finding above the floor stays a comment. Residual
+cannot be enabled without `review.approve.enabled`. The floor must be at
+least `review.min_severity` or Validate refuses it as unreachable, and when
+`review.fail_on` is a finding severity the floor must sit strictly below it
+so residual cannot APPROVE a run that still fails the gate. The engine
+path is `judgeResidualApprove` in package `review`.
 
 The GitHub App or token needs Pull requests write, which posting reviews
 already needs. A GitHub App cannot approve a pull request it opened itself, so

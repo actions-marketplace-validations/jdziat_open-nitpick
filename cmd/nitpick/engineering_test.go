@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -461,6 +462,254 @@ func TestReviewBoundaryApplicabilityKeepsMissingGoInputsIncomplete(t *testing.T)
 	}
 }
 
+func TestEngineeringScopeLiftsFileCapAndMarksSelectedProfile(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Review.MaxFiles = 3
+	applyEngineeringScope(cfg)
+	if cfg.Practices.Profile != "engineering" || cfg.Review.MaxFiles != 1<<30 {
+		t.Fatalf("engineering scope kept a file cap or lost the profile: profile=%q files=%d", cfg.Practices.Profile, cfg.Review.MaxFiles)
+	}
+}
+
+func TestPackageCoverageUsesSuccessfulTasksInsteadOfSharedFiles(t *testing.T) {
+	a := practices.Target{Kind: practices.FileTarget, ID: "a.go"}
+	b := practices.Target{Kind: practices.FileTarget, ID: "b.go"}
+	tasks := []practices.DesignTask{
+		{ID: "package:a", Source: a, Sources: []practices.Target{a}, Context: []practices.Target{b}, SourceDigest: strings.Repeat("a", 64), Purpose: "assess a"},
+		{ID: "package:b", Source: b, Sources: []practices.Target{b}, Context: []practices.Target{a}, SourceDigest: strings.Repeat("b", 64), Purpose: "assess b"},
+	}
+	entries := []bundle.Entry{{File: &diff.File{Path: "a.go"}, Content: "package a"}, {File: &diff.File{Path: "b.go"}, Content: "package b"}}
+	report := &review.Report{DesignExecution: &review.DesignExecution{DesignPacking: practices.DesignPacking{Design: practices.DesignPlan{Tasks: tasks}}}, Plan: &bundle.Plan{Batches: []bundle.Batch{{DesignTask: "package:a", Entries: entries}, {DesignTask: "package:b", Entries: entries}}}, AssessedDesignTasks: []string{"package:a"}}
+	result := modelCheckResults([]practices.Check{{ID: "design", Planned: []practices.Target{a, b}}}, report)[0]
+	if result.State != practices.Partial || len(result.Examined) != 1 || result.Examined[0].ID != "package:a" || len(result.Omitted) != 1 || result.Omitted[0].Target.ID != "package:b" {
+		t.Fatalf("shared source became successful task coverage: %+v", result)
+	}
+	report.AssessedDesignTasks = append(report.AssessedDesignTasks, "package:b")
+	completed := modelCheckResults([]practices.Check{{ID: "design"}}, report)[0]
+	if completed.State != practices.Completed || len(completed.Examined) != 2 || len(completed.Tasks) != 2 {
+		t.Fatalf("empty successful assessments lost task evidence: %+v", completed)
+	}
+	report.DesignExecution.Design.Errors = []string{"caller inventory truncated"}
+	partial := modelCheckResults([]practices.Check{{ID: "design"}}, report)[0]
+	if partial.State != practices.Partial || len(partial.FailedStages) == 0 {
+		t.Fatalf("unknown graph scope was promoted: %+v", partial)
+	}
+}
+
+func TestEngineeringAssessmentUsesFrozenSourceWithoutProviderReads(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q", "-b", "main")
+	write(t, root, "go.mod", "module example.com/frozen\n\ngo 1.25\n")
+	write(t, root, "a.go", "package frozen\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-qm", "feat: initial")
+	provider := &assessmentReadTrap{Provider: vcs.NewLocal(root, nil)}
+	report := &review.Report{Files: diff.Files{&diff.File{Path: "a.go"}}, Plan: &bundle.Plan{}, DesignExecution: &review.DesignExecution{Sources: []standards.File{
+		{Path: "a.go", Src: []byte("package frozen\n")},
+		{Path: "go.mod", Src: []byte("module example.com/frozen\n")},
+		{Path: "background/b.go", Src: []byte("package background\n")},
+	}}}
+	cfg := config.Defaults()
+	cfg.Practices.Boundaries = []config.PracticeBoundary{{From: "*", Forbid: []string{"forbidden"}}}
+	result := assessReviewPractices(t.Context(), root, cfg, vcs.Ref{Base: "main", Head: vcs.Worktree}, nil, report, provider)
+	if provider.reads != 0 {
+		t.Fatalf("assessment reread frozen source %d times", provider.reads)
+	}
+	for _, check := range result.Checks {
+		if check.ID == "snapshot" {
+			t.Fatalf("frozen source became unavailable: %+v", check)
+		}
+		if check.ID == "design-boundaries" && (check.State != practices.Completed || len(check.Examined) != 1 || check.Examined[0].ID != "a.go") {
+			t.Fatalf("boundary scope changed: %+v", check)
+		}
+	}
+	if len(result.Design.Units) != 1 || result.Design.Units[0].ID != "example.com/frozen" {
+		t.Fatalf("frozen module identity lost: %+v", result.Design)
+	}
+}
+
+// TestEngineeringAssessmentIgnoresUnrelatedPackingLimits pins PR 121's own
+// failure: an oversized, unrelated evidence file the design pass could not
+// pack, plus a design task another file exceeded review.max_files_per_request
+// for, must not fail design-boundaries, linters or snapshot for a change
+// whose own Go source and boundaries were fully examined.
+func TestEngineeringAssessmentIgnoresUnrelatedPackingLimits(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q", "-b", "main")
+	write(t, root, "go.mod", "module example.com/frozen\n\ngo 1.25\n")
+	write(t, root, "a.go", "package frozen\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-qm", "feat: initial")
+	provider := vcs.NewLocal(root, nil)
+	report := &review.Report{
+		Files: diff.Files{&diff.File{Path: "a.go"}, &diff.File{Path: "fixtures/big.json"}},
+		Plan: &bundle.Plan{Skipped: []bundle.Skip{
+			{Path: "declaration:cmd/nitpick/other.go", Reason: "complete design task exceeds review.max_files_per_request"},
+		}},
+		Linters: []review.LinterStatus{{Linter: "golangci-lint", Outcome: review.LinterRan}},
+		DesignExecution: &review.DesignExecution{
+			DesignPacking: practices.DesignPacking{Design: practices.DesignPlan{
+				Errors: []string{"fixtures/big.json: exceeded review.max_file_bytes"},
+			}},
+			Sources: []standards.File{
+				{Path: "a.go", Src: []byte("package frozen\n")},
+				{Path: "go.mod", Src: []byte("module example.com/frozen\n")},
+			},
+			Omitted: []bundle.Skip{{Path: "fixtures/big.json", Reason: bundle.ReasonTooLarge}},
+		},
+	}
+	cfg := config.Defaults()
+	cfg.Linters.Enabled = []string{"golangci-lint"}
+	cfg.Practices.Boundaries = []config.PracticeBoundary{{From: "*", Forbid: []string{"forbidden"}}}
+	result := assessReviewPractices(t.Context(), root, cfg, vcs.Ref{Base: "main", Head: vcs.Worktree}, nil, report, provider)
+	for _, check := range result.Checks {
+		switch check.ID {
+		case "design-boundaries":
+			if check.State != practices.Completed {
+				t.Fatalf("an unrelated oversized file left design-boundaries %s: %+v", check.State, check)
+			}
+		case "linters":
+			if check.State != practices.Completed {
+				t.Fatalf("an unrelated design-task packing limit left linters %s: %+v", check.State, check)
+			}
+		case "snapshot":
+			t.Fatalf("a disclosed, too-large omission was reported as an unexplained snapshot failure: %+v", check)
+		}
+	}
+}
+
+type assessmentReadTrap struct {
+	vcs.Provider
+	reads int
+}
+
+func (p *assessmentReadTrap) FileContent(context.Context, vcs.Ref, string) ([]byte, error) {
+	p.reads++
+	return nil, errors.New("source changed after capture")
+}
+
+func TestFrozenMetadataDoesNotInventAnOuterModuleIdentity(t *testing.T) {
+	for _, omitted := range []bool{false, true} {
+		execution := &review.DesignExecution{Sources: []standards.File{{Path: "go.mod", Src: []byte("module example.com/outer\n")}}}
+		if omitted {
+			execution.Omitted = []bundle.Skip{{Path: "nested/go.mod", Reason: bundle.ReasonUnavailable}}
+		} else {
+			execution.Excluded = []bundle.Skip{{Path: "nested/go.mod", Reason: bundle.ReasonIgnored}}
+		}
+		files, problems := frozenDesignContext([]standards.File{{Path: "nested/a.go", Src: []byte("package nested\n")}}, execution)
+		inventory, _ := practices.InspectDesign(files, nil)
+		if len(problems) == 0 || len(inventory.Errors) == 0 || len(inventory.Units) != 0 {
+			t.Fatalf("missing metadata invented a package: %+v; %v", inventory, problems)
+		}
+	}
+}
+
+func TestFrozenMetadataDoesNotPoisonUnrelatedDirectoriesFromAnUnrelatedError(t *testing.T) {
+	execution := &review.DesignExecution{
+		Sources:       []standards.File{{Path: "go.mod", Src: []byte("module example.com/outer\n")}},
+		DesignPacking: practices.DesignPacking{Design: practices.DesignPlan{Errors: []string{"unrelated/oversized.json: exceeded review.max_file_bytes"}}},
+	}
+	files, problems := frozenDesignContext([]standards.File{{Path: "nested/a.go", Src: []byte("package nested\n")}}, execution)
+	inventory, _ := practices.InspectDesign(files, nil)
+	if len(problems) != 0 {
+		t.Fatalf("an unrelated snapshot error invented a module placeholder: %+v; %v", inventory, problems)
+	}
+	if len(inventory.Units) != 1 || inventory.Units[0].ID != "example.com/outer/nested" {
+		t.Fatalf("unrelated directory lost its outer module identity: %+v", inventory)
+	}
+}
+
+func TestDesignCoveragePublishesThePlannerScopeLimitations(t *testing.T) {
+	report := &review.Report{DesignExecution: &review.DesignExecution{DesignPacking: practices.DesignPacking{Design: practices.DesignPlan{Limitations: []string{"deeper implementation bodies were not supplied"}}}}}
+	check := practices.Check{ID: "design"}
+	applyPackageCoverage(&check, report)
+	if !slices.Equal(check.Limitations, report.DesignExecution.Design.Limitations) {
+		t.Fatalf("lost planner limits: %+v", check)
+	}
+	text := (practices.Report{Profile: "engineering", Checks: []practices.Check{check}}).Text()
+	if !strings.Contains(text, "Scope limit: deeper implementation bodies were not supplied") {
+		t.Fatalf("hidden planner limit: %s", text)
+	}
+	data, err := json.Marshal(check)
+	if err != nil || !strings.Contains(string(data), `"limitations":["deeper implementation bodies were not supplied"]`) {
+		t.Fatalf("JSON lost limits: %s %v", data, err)
+	}
+}
+
+func TestSlopCoverageKeepsSuccessfulReadsAcrossSharedTaskFailures(t *testing.T) {
+	source := practices.Target{Kind: practices.FileTarget, ID: "source.go"}
+	tasks := []practices.DesignTask{
+		{ID: "first", Source: source, Sources: []practices.Target{source}, SourceDigest: strings.Repeat("a", 64), Purpose: "first declaration"},
+		{ID: "second", Source: source, Sources: []practices.Target{source}, SourceDigest: strings.Repeat("b", 64), Purpose: "second declaration"},
+	}
+	entry := bundle.Entry{File: &diff.File{Path: source.ID}, Content: "package fixture\nfunc A() {}\nfunc B() {}\n"}
+	report := &review.Report{DesignExecution: &review.DesignExecution{DesignPacking: practices.DesignPacking{Design: practices.DesignPlan{Tasks: tasks}}}, Plan: &bundle.Plan{Batches: []bundle.Batch{{DesignTask: "first", Entries: []bundle.Entry{entry}}, {DesignTask: "second", Entries: []bundle.Entry{entry}}}}, AssessedDesignTasks: []string{"first"}, Incomplete: []string{source.ID}}
+	checks := func() []practices.Check {
+		return modelCheckResults([]practices.Check{{ID: "slop", Planned: []practices.Target{source}}, {ID: "design"}}, report)
+	}
+	got := checks()
+	if got[0].State != practices.Completed || len(got[0].Examined) != 1 || got[1].State != practices.Partial || len(got[1].Examined) != 1 || len(got[1].Omitted) != 1 {
+		t.Fatalf("shared failure erased completed evidence: %+v", got)
+	}
+	report.AssessedDesignTasks = nil
+	report.Incomplete = nil
+	for _, check := range checks() {
+		if len(check.Examined) != 0 || check.State == practices.Completed {
+			t.Fatalf("planned source claimed a read: %+v", check)
+		}
+	}
+}
+
+func TestSlopFindingOnRelatedContextFileHasExaminedEvidence(t *testing.T) {
+	changed := practices.Target{Kind: practices.FileTarget, ID: "app.go"}
+	report := &review.Report{
+		Plan:     &bundle.Plan{RelatedFiles: []string{"helper.go"}, Batches: []bundle.Batch{{Entries: []bundle.Entry{{File: &diff.File{Path: changed.ID}, Content: "package app"}}}}},
+		Findings: []review.Finding{{Path: "helper.go", Line: 3, Class: string(config.ClassSlop), Title: "unrelated context finding"}},
+	}
+	checks := modelCheckResults([]practices.Check{{ID: "slop", Version: "1", Instrument: practices.Model, Planned: []practices.Target{changed}}}, report)
+	slopReport := practices.Report{SchemaVersion: practices.SchemaVersion, Profile: "engineering", Revision: "head", PolicySource: "operator", PolicyDigest: "digest", Checks: checks}
+	if problems := slopReport.Problems(); len(problems) != 0 {
+		t.Fatalf("a slop finding on a related, unplanned file was rejected as unexamined: %v", problems)
+	}
+}
+
+func TestFocusedDesignCompletionDoesNotInventWholeFileSlopCoverage(t *testing.T) {
+	files := []standards.File{{Path: "go.mod", Src: []byte("module example.com/app\n")}, {Path: "app.go", Src: []byte("package app\nfunc First(){}\nfunc Second(){}\n")}}
+	inventory, _ := practices.InspectDesign(files, nil)
+	plan := practices.PlanDesignInteractions(t.Context(), inventory, files, []string{"app.go"})
+	designOnly, slopOnly := plan, plan
+	designOnly.Tasks = slices.DeleteFunc(slices.Clone(plan.Tasks), func(task practices.DesignTask) bool { return task.SlopOnly })
+	slopOnly.Tasks = slices.DeleteFunc(slices.Clone(plan.Tasks), func(task practices.DesignTask) bool { return !task.SlopOnly })
+	if len(designOnly.Tasks) != 2 || len(slopOnly.Tasks) != 1 {
+		t.Fatalf("unexpected task scope: %+v", plan)
+	}
+	packed := practices.PackDesign(t.Context(), config.Defaults(), designOnly, files, nil, bundle.Reserve{})
+	report := &review.Report{Plan: packed.Plan, DesignExecution: &review.DesignExecution{DesignPacking: practices.DesignPacking{Design: plan}}}
+	for _, batch := range packed.Plan.Batches {
+		report.AssessedDesignTasks = append(report.AssessedDesignTasks, batch.DesignTaskIDs()...)
+	}
+	checks := func() []practices.Check {
+		return modelCheckResults([]practices.Check{{ID: "slop", Planned: []practices.Target{{Kind: practices.FileTarget, ID: "app.go"}}}, {ID: "design"}}, report)
+	}
+	got := checks()
+	if got[0].State != practices.Partial || len(got[0].Examined) != 0 || got[1].State != practices.Completed || len(got[1].Examined) != 2 || len(got[1].Context) != 0 {
+		t.Fatalf("design excerpts claimed a whole-source pass: %+v", got)
+	}
+	full := practices.PackDesign(t.Context(), config.Defaults(), slopOnly, files, nil, bundle.Reserve{})
+	if len(full.Plan.Batches) != 1 {
+		t.Fatal("whole-source slop request did not pack")
+	}
+	report.Plan.Batches = append(report.Plan.Batches, full.Plan.Batches...)
+	if checks()[0].State != practices.Partial || len(checks()[1].Context) != 0 {
+		t.Fatal("planned slop request claimed success or supplied examined context")
+	}
+	report.AssessedDesignTasks = append(report.AssessedDesignTasks, full.Plan.Batches[0].DesignTaskIDs()...)
+	got = checks()
+	if got[0].State != practices.Completed || len(got[0].Examined) != 1 || len(got[1].Examined) != 2 || len(got[1].Tasks) != 2 || !slices.Contains(got[1].Context, practices.Target{Kind: practices.FileTarget, ID: "app.go"}) {
+		t.Fatalf("whole-source pass lost slop or inflated design coverage: %+v", got)
+	}
+}
+
 type fixedContent struct{ body []byte }
 
 func (fixedContent) Name() string { return "fixture" }
@@ -520,5 +769,58 @@ func TestEngineeringReviewPolicySurvivesNilSourceAndLoaded(t *testing.T) {
 	cfg, modified, err := p.ResolvePolicy(context.Background(), vcs.Ref{}, nil, nil)
 	if err != nil || cfg != nil || modified {
 		t.Fatalf("got cfg=%v modified=%v err=%v, want nil/false/nil", cfg, modified, err)
+	}
+}
+
+func TestSlopFindingsRetainOnlyAssessedSupportingSourceEvidence(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		assessed  bool
+		lines     []int
+		valid     bool
+		decision  bool
+		truncated bool
+	}{
+		{name: "assessed excerpt", assessed: true, lines: []int{3}, valid: true},
+		{name: "assessed decision", assessed: true, lines: []int{3}, valid: true, decision: true},
+		{name: "unassessed excerpt", lines: []int{3}},
+		{name: "outside excerpt", assessed: true, lines: []int{7}},
+		{name: "mixed supported and unsupported lines", assessed: true, lines: []int{3, 7}},
+		{name: "truncated excerpt", assessed: true, lines: []int{3}, truncated: true},
+		{name: "no findings", assessed: true, valid: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			changed := practices.Target{Kind: practices.FileTarget, ID: "app.go"}
+			report := &review.Report{
+				DesignExecution:     &review.DesignExecution{},
+				AssessedDesignTasks: []string{"slop"},
+				Plan: &bundle.Plan{Batches: []bundle.Batch{
+					{DesignTask: "slop", Entries: []bundle.Entry{{File: &diff.File{Path: "app.go"}, Content: "package app\n"}}},
+					{DesignTask: "focus", Entries: []bundle.Entry{{SourceOnly: true, File: &diff.File{Path: "helper.go"}, Content: "func helper() {}", SourceSpans: []bundle.SourceSpan{{Start: 2, End: 4}}}}},
+				}},
+			}
+			report.Plan.Batches[1].Entries[0].Truncated = scenario.truncated
+			if scenario.assessed {
+				report.AssessedDesignTasks = append(report.AssessedDesignTasks, "focus")
+			}
+			for _, line := range scenario.lines {
+				report.Findings = append(report.Findings, review.Finding{Path: "helper.go", Line: line, Class: string(config.ClassSlop), Title: "supporting-source finding"})
+			}
+			if scenario.decision {
+				for _, finding := range report.Findings {
+					report.Overruled = append(report.Overruled, review.Overruled{Finding: finding, Expert: "maintainer", Reason: "intentional"})
+				}
+				report.Findings = nil
+			}
+			checks := modelCheckResults([]practices.Check{{ID: "slop", Version: "1", Instrument: practices.Model, Planned: []practices.Target{changed}}}, report)
+			evidence := slices.Contains(checks[0].Context, practices.Target{Kind: practices.FileTarget, ID: "helper.go"})
+			if evidence != (scenario.valid && len(scenario.lines) > 0) {
+				t.Fatalf("unexpected evidence: %+v", checks[0].Context)
+			}
+			r := practices.Report{SchemaVersion: practices.SchemaVersion, Profile: "engineering", Revision: "head", PolicySource: "operator", PolicyDigest: "digest", Checks: checks}
+			if problems := r.Problems(); (len(problems) == 0) != scenario.valid {
+				t.Fatalf("problems=%v, valid=%v", problems, scenario.valid)
+			}
+		})
 	}
 }

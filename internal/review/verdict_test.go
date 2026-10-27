@@ -32,6 +32,7 @@ func verdictsFor(findings []Finding) []Verdict {
 			Title:      f.Title,
 			Rationale:  f.Rationale,
 			Suggestion: f.Suggestion,
+			FixEndLine: f.FixEndLine,
 		})
 	}
 	return out
@@ -267,6 +268,32 @@ func TestAVerdictCannotMoveAFindingOntoUnreadCode(t *testing.T) {
 	}
 }
 
+// A shorter replacement written for the anchored line alone must not inherit
+// the reviewer's wider range: applyVerdict has to take FixEndLine from the
+// verdict along with Suggestion, or a stale range from the original finding
+// survives under new replacement text and deletes lines nobody proposed
+// touching.
+func TestAReplacementSuggestionCarriesItsOwnFixEndLine(t *testing.T) {
+	before := []Finding{{
+		Path: "app.go", Line: 4, Severity: "warning", Class: "correctness", Title: "Reviewer's title",
+		Rationale: "why", Suggestion: "line4\nline5\nline6", FixEndLine: 6,
+	}}
+
+	shorter, _ := triageWith(t, before, TriageResult{Verdicts: []Verdict{{
+		Number: 1, Severity: "warning", Class: "correctness", Line: 4, Suggestion: "replacement", FixEndLine: 4,
+	}}})
+	if shorter[0].FixEndLine != 4 {
+		t.Errorf("FixEndLine = %d, want triage's 4: a one-line replacement must not keep the reviewer's wider range", shorter[0].FixEndLine)
+	}
+
+	held, _ := triageWith(t, before, TriageResult{Verdicts: []Verdict{{
+		Number: 1, Severity: "warning", Class: "correctness",
+	}}})
+	if held[0].FixEndLine != 6 {
+		t.Errorf("FixEndLine = %d, want the reviewer's 6 kept when triage sends no replacement", held[0].FixEndLine)
+	}
+}
+
 // A model's own severity word goes stale when triage re-rates it. An
 // analyzer's does not: HIGH is what semgrep printed whatever we publish at.
 func TestAStaleSeverityWordIsDroppedOnlyForAModelFinding(t *testing.T) {
@@ -380,7 +407,7 @@ func TestAMergeSurvivesTheShippedSchema(t *testing.T) {
 		}
 	}
 
-	// And the wire shape a model would actually send decodes into a merge.
+	// And the wire shape a model sends decodes into a merge.
 	var result TriageResult
 	if err := json.Unmarshal([]byte(`{"findings":[{"number":1,"severity":"error","class":"security"}],
 		"summary":"s","dropped":[{"number":2,"duplicate_of":1,"reason":"same defect"}]}`), &result); err != nil {

@@ -25,8 +25,6 @@ const EnvPrices = "NITPICK_EVAL_PRICES"
 
 // staleAfterDays is when a price stops being reported as merely dated and
 // starts being reported as STALE.
-//
-// The note behind it is in docs/harness-notes.md#staleafterdays.
 const staleAfterDays = 30
 
 // shippedPrices is the price table compiled in, so cost reporting works from
@@ -95,10 +93,9 @@ func (c CallUsage) Total() int { return c.Prompt + c.Completion + c.CacheRead + 
 type TokenUsage struct {
 	PerCall []CallUsage
 
-	// Unreported is how many calls returned a response carrying no usage, the
-	// state that has to stay visible, because a cost column that is sometimes
-	// measured and sometimes guessed with no way to tell which is worse than no
-	// cost column.
+	// Unreported is how many calls returned a response carrying no usage. It
+	// stays visible so a cost column is never part measured and part guessed
+	// without saying which.
 	Unreported int
 
 	// Failed is how many calls returned an error, and it is a stated BLIND SPOT
@@ -1426,8 +1423,6 @@ func (l *CostLedger) rowsAt(in map[string]*modelSpend, now time.Time) []CostRow 
 // be ranked against the others, in two parts: the largest fixture SET any row
 // was priced on, and the DEPTH, priced runs per fixture, the most thorough row
 // reached on each of them.
-//
-// The note behind it is in docs/harness-notes.md#referencecorpus.
 func (l *CostLedger) referenceCorpus(in map[string]*modelSpend) (fixtures []string, depth map[string]int) {
 	depth = map[string]int{}
 
@@ -1499,8 +1494,6 @@ func (s ShortFixture) String() string {
 // every
 // fixture but measured some of them fewer times than the standard it is held
 // to.
-//
-// The note behind it is in docs/harness-notes.md#shallowsamplewarning.
 func ShallowSampleWarning(model, standard, dropped, readings string, short []ShortFixture) string {
 	if len(short) == 0 {
 		return ""
@@ -1607,8 +1600,6 @@ func (r CostRow) Comparable() bool {
 }
 
 // Recall is the share of planted defects this row's MEASURED reviews found.
-//
-// The note behind it is in docs/harness-notes.md#recall.
 func (r CostRow) Recall() (float64, bool) {
 	if r.Planted == 0 {
 		return 0, false
@@ -1649,12 +1640,10 @@ func (r CostRow) coverageReason() string {
 			r.Model, r.Covered, r.PeerCoverage, strings.Join(r.Missing, ", "))
 
 	case len(r.Shallow) > 0:
-		// Deliberately worded as SELECTION rather than as thin sampling. Fewer
-		// priced runs on a fixture its peers completed is not merely a smaller
-		// sample: the runs that dropped out are the ones whose usage went
-		// unreported, and nothing here can rule out that they are also the ones
-		// that found nothing. Read as "n=2 instead of n=3" a reader shrugs; read
-		// as "priced on the runs that went well" they do not.
+		// Worded as selection, not thin sampling. The runs that dropped out are
+		// the ones whose usage went unreported, and nothing here rules out that
+		// they are also the ones that found nothing. "n=2 instead of n=3" gets a
+		// shrug; "priced on the runs that went well" does not.
 		//
 		// Rendered by ShallowSampleWarning, which the judged tables now print
 		// too. The wording was right and was reachable from one table only.
@@ -1754,8 +1743,6 @@ func (r CostRow) PerReview() Cost {
 }
 
 // PerDefect is what this model costs per planted defect it found.
-//
-// The note behind it is in docs/harness-notes.md#perdefect.
 func (r CostRow) PerDefect() Cost {
 	total := r.Total()
 	if !total.Known {
@@ -1907,8 +1894,6 @@ func PublishedCostReadings() []CostReading {
 
 // DescriptiveCostColumns identify a row, state how much measurement is behind
 // it, or disclose a limit on it. None of them is a score.
-//
-// The note behind it is in docs/harness-notes.md#descriptivecostcolumns.
 func DescriptiveCostColumns() []string {
 	return []string{
 		"MODEL", "REVIEWS", "PRICED", "COV", "FAILED", "DEFECTS", "TOKENS", "COST", "SPREAD", "AGE",
@@ -2061,8 +2046,6 @@ func (l *CostLedger) OrderingNotes() []string {
 }
 
 // CostTableHeader is the cost block's header.
-//
-// The note behind it is in docs/harness-notes.md#costtableheader.
 const CostTableHeader = "MODEL                                REVIEWS  PRICED  COV  FAILED  DEFECTS  TOKENS     COST        $/REVIEW    RECALL      NOISE  ANCHOR  $/DEFECT     SPREAD     AGE"
 
 // CostReadingLegend is printed under the cost table, for the same reason
